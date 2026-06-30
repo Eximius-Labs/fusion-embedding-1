@@ -57,7 +57,8 @@ class TextMemoryBank:
         """Add a [b, dim] batch of text embeddings, overwriting oldest on wraparound."""
         if emb.dim() != 2 or emb.size(1) != self.dim:
             raise ValueError(f"expected [b, {self.dim}], got {tuple(emb.shape)}")
-        emb = emb.detach().to(self.device)
+        # cast to the buffer's dtype/device — the base may emit bf16 while the bank is fp32
+        emb = emb.detach().to(device=self.device, dtype=self._buf.dtype)
         b = emb.size(0)
         if b >= self.capacity:                         # batch bigger than bank: keep the last `capacity`
             self._buf.copy_(emb[-self.capacity:])

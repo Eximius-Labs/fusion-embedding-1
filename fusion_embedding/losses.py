@@ -118,7 +118,16 @@ class FusionContrastiveLoss(nn.Module):
         hard_neg_text: Optional[torch.Tensor] = None,  # [B,K,d_llm] full-dim pooled
         bank_text: Optional[torch.Tensor] = None,       # [M,d_llm] frozen-text memory bank
     ) -> tuple[torch.Tensor, dict]:
-        scale = logit_scale.exp()
+        # Contrastive math runs in fp32 for stability and to avoid dtype mixing when the
+        # frozen base emits bf16 while the bank/connector are fp32 (HLD §5.3: trained
+        # params in fp32). Casting here keeps every downstream matmul same-dtype.
+        audio = audio.float()
+        text = text.float()
+        if hard_neg_text is not None:
+            hard_neg_text = hard_neg_text.float()
+        if bank_text is not None:
+            bank_text = bank_text.float()
+        scale = logit_scale.exp().float()
 
         infonce = audio.new_zeros(())
         for dim, w in zip(self.mrl_dims, self.mrl_weights):

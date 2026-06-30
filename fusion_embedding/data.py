@@ -117,6 +117,36 @@ class RealAudioProcessor:
 # ---------------------------------------------------------------------------- #
 # Dataset
 # ---------------------------------------------------------------------------- #
+class CachedFeatureDataset(Dataset):
+    """Dataset over precomputed mel features saved as ``.pt`` dicts ``{mel, text, task}``.
+
+    This is the production training source: ``preprocess`` decodes audio -> mel once and
+    writes one file per clip; training reads them back here (no audio decode on the GPU
+    box). Emits the same item dict shape as ``FusionAudioTextManifest`` so the collator
+    and model consume it unchanged.
+    """
+
+    def __init__(self, paths: Sequence[str]):
+        self.paths = list(paths)
+        if not self.paths:
+            raise ValueError("CachedFeatureDataset got no feature files")
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int) -> dict:
+        d = torch.load(self.paths[i], map_location="cpu", weights_only=False)
+        task = d.get("task", "sound")
+        if task not in TASK_INSTRUCTIONS:
+            task = "sound"
+        return {
+            "mel": d["mel"],
+            "text": d["text"],
+            "task": task,
+            "instruction": instruction_for(task),
+        }
+
+
 class FusionAudioTextManifest(Dataset):
     """Audio↔text pairs tagged with a §6 task. Each record: {audio, text, task[, id]}."""
 

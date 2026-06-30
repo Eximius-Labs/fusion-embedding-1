@@ -83,7 +83,9 @@ class RegressionGuard:
     def max_drift(self, model: FusionEmbeddingModel) -> float:
         drift = 0.0
         for pid, p in self._frozen_by_id(model):
-            drift = max(drift, (p.detach() - self._snapshot[pid]).abs().max().item())
+            # snapshot may live on a different device than the (possibly moved) model
+            snap = self._snapshot[pid].to(p.device)
+            drift = max(drift, (p.detach() - snap).abs().max().item())
         return drift
 
     def check(self, model: FusionEmbeddingModel) -> None:
@@ -103,10 +105,11 @@ def encode_dataset(
     *,
     dim: Optional[int] = None,
     batch_size: int = 16,
-    device: str = "cpu",
+    device=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Embed every pair -> (audio_emb [M,dim], text_emb [M,dim]) at an MRL rung, L2-normed."""
     model.eval()
+    device = device if device is not None else next(model.parameters()).device
     dim = dim or model.cfg.mrl_default
     loader = DataLoader(manifest, batch_size=batch_size, collate_fn=collator, shuffle=False)
     a_chunks, t_chunks = [], []
@@ -139,12 +142,12 @@ def evaluate(
     collator: FusionCollator,
     guard: Optional[RegressionGuard] = None,
     *,
-    device: str = "cpu",
+    device=None,
 ) -> dict:
     """AudioCaps/Clotho-style R@1/R@10 (A→T, T→A) + the MMEB-V2 regression guard.
 
-    SEAM (HLD §10.5): swap ``eval_manifest`` for real AudioCaps/Clotho and add the
-    real MMEB-V2 subset pass alongside ``guard`` for the full release gate.
+    Device follows the model unless overridden. SEAM (HLD §10.5): swap ``eval_manifest``
+    for real AudioCaps/Clotho and add the real MMEB-V2 subset pass alongside ``guard``.
     """
     audio_emb, text_emb = encode_dataset(model, eval_manifest, collator, device=device)
     report = retrieval_report(audio_emb, text_emb)
@@ -299,29 +302,14 @@ def load_components(
     base_model: str = "Qwen/Qwen3-VL-Embedding-2B",
     audio_model: str = "Qwen/Qwen2.5-Omni-7B",
     device: str = "cuda",
+    **kwargs,
 ):  # pragma: no cover - real pipeline only; not exercised by CPU tests
-    """Load Qwen3-VL-Embedding (base) + Qwen2.5-Omni audio tower; return the injection seams.
-
-    Returns (cfg_with_tokens, embed_tokens, base_lm, audio_encoder) ready for
-    ``FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder)``.
-
-    TODO(fusion) — the five seams from HLD §10:
-      1. Load ``base_model``; grab the LM that accepts ``inputs_embeds`` and the
-         module exposing ``embed_tokens``. Add the ``<|audio_pad|>`` special token
-         and resolve cfg.audio_pad_id / cfg.eos_id from the tokenizer.
-      2. Confirm the base accepts ``inputs_embeds`` and that placeholder splicing
-         matches its image-token path (HLD §4.1).
-      3. Extract the Omni audio tower (mel + mask in 2 s blocks) -> frames [B,T,1280].
-      4. Wire the Omni feature extractor into ``RealAudioProcessor`` (HLD §10.4).
-      5. EOS pooling + MMEB-V2 regression guard live in ``evaluate`` (HLD §10.5).
+    """Load the frozen Qwen base + Omni audio tower (HLD §10). Thin delegator to
+    ``hf_components.load_components`` (kept separate so the core package never imports
+    ``transformers``). Returns
+    ``(cfg, embed_tokens, base_lm, audio_encoder, tokenizer, feature_extractor)`` —
+    feed the three callables to ``FusionEmbeddingModel``.
     """
-    try:
-        from transformers import AutoModel, AutoTokenizer  # noqa: F401
-    except ImportError as e:
-        raise ImportError("load_components needs the 'hf' extra (transformers).") from e
+    from .hf_components import load_components as _load
 
-    raise NotImplementedError(
-        "load_components is the HF wiring seam (HLD §10). The frozen-base interface it must "
-        "return is fully specified and exercised by the tiny stand-ins in fusion_embedding._tiny; "
-        "wire the real Qwen modules to that same (embed_tokens, base_lm, audio_encoder) contract."
-    )
+    return _load(cfg, base_model, audio_model, device=device, **kwargs)
