@@ -147,6 +147,74 @@ class CachedFeatureDataset(Dataset):
         }
 
 
+class CachedFrameDataset(Dataset):
+    """Dataset over precomputed frozen-encoder frames saved as ``{frames, text, task}`` ``.pt``.
+
+    The Option 2 fast path: the frozen audio tower ran once in ``precompute_frames``, so training
+    reads frames directly (no audio decode AND no encoder forward). Emits ``frames`` [T, d_audio].
+    """
+
+    def __init__(self, paths: Sequence[str]):
+        self.paths = list(paths)
+        if not self.paths:
+            raise ValueError("CachedFrameDataset got no frame files")
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int) -> dict:
+        d = torch.load(self.paths[i], map_location="cpu", weights_only=False)
+        task = d.get("task", "sound")
+        if task not in TASK_INSTRUCTIONS:
+            task = "sound"
+        return {
+            "frames": d["frames"],
+            "text": d["text"],
+            "task": task,
+            "instruction": instruction_for(task),
+        }
+
+
+class InMemoryFrameDataset(Dataset):
+    """Frames held in RAM (list of ``{frames, text, task}``) — no per-step disk I/O.
+
+    Precomputed frames are ~7x larger than mel, so reading them from a network Volume every
+    step starves the GPU. Loading them once into RAM (a few GB) and serving from memory keeps
+    the connector fed. Build via ``from_paths`` (one sequential read) or pass items directly.
+    """
+
+    def __init__(self, items: Sequence[dict]):
+        self.items = list(items)
+
+    @classmethod
+    def from_paths(cls, paths: Sequence[str], half: bool = True, log_every: int = 0) -> "InMemoryFrameDataset":
+        items = []
+        for i, p in enumerate(paths):
+            d = torch.load(p, map_location="cpu", weights_only=False)
+            fr = d["frames"]
+            if half:
+                fr = fr.half()                          # halve RAM/copy cost; cast back at use
+            items.append({"frames": fr, "text": d["text"], "task": d.get("task", "sound")})
+            if log_every and i % log_every == 0:
+                print(f"  preloaded {i}/{len(paths)}", flush=True)
+        return cls(items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, i: int) -> dict:
+        d = self.items[i]
+        task = d.get("task", "sound")
+        if task not in TASK_INSTRUCTIONS:
+            task = "sound"
+        return {
+            "frames": d["frames"].float(),
+            "text": d["text"],
+            "task": task,
+            "instruction": instruction_for(task),
+        }
+
+
 class FusionAudioTextManifest(Dataset):
     """Audio↔text pairs tagged with a §6 task. Each record: {audio, text, task[, id]}."""
 
@@ -222,6 +290,38 @@ class FusionCollator:
         return {
             "mel": mel,
             "mel_mask": mel_mask,
+            "audio_input_ids": audio_ids,
+            "audio_attention_mask": audio_mask,
+            "text_input_ids": text_ids,
+            "text_attention_mask": text_mask,
+            "tasks": [it["task"] for it in items],
+        }
+
+
+@dataclass
+class FrameCollator(FusionCollator):
+    """Collator for the precomputed-frames path: pads frames [B,T,d_audio] + frame_mask,
+    reusing the audio-token-id and instruction-templated text logic from FusionCollator."""
+
+    def _pad_frames(self, frames: list[torch.Tensor]):
+        d = frames[0].shape[-1]
+        Tmax = max(f.shape[0] for f in frames)
+        B = len(frames)
+        out = torch.zeros(B, Tmax, d)
+        mask = torch.zeros(B, Tmax, dtype=torch.bool)
+        for b, f in enumerate(frames):
+            t = f.shape[0]
+            out[b, :t] = f
+            mask[b, :t] = True
+        return out, mask
+
+    def __call__(self, items: list[dict]) -> dict:
+        frames, frame_mask = self._pad_frames([it["frames"] for it in items])
+        audio_ids, audio_mask = self._audio_token_ids(len(items))
+        text_ids, text_mask = self._text_ids(items)
+        return {
+            "frames": frames,
+            "frame_mask": frame_mask,
             "audio_input_ids": audio_ids,
             "audio_attention_mask": audio_mask,
             "text_input_ids": text_ids,

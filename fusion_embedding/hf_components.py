@@ -61,10 +61,24 @@ class OmniAudioAdapter(nn.Module):
     The encoder is frozen and runs under ``no_grad``; batch-packing is a later optimization.
     """
 
-    def __init__(self, encoder: nn.Module, d_audio: int):
+    def __init__(self, encoder: nn.Module, d_audio: int, feature_layer: str = "post_proj"):
         super().__init__()
         self.encoder = encoder
         self.d_audio = d_audio
+        # "post_proj": the encoder's returned last_hidden_state (output_dim, 3584; projected
+        #   toward Omni's OWN thinker text space).
+        # "pre_proj":  the 1280-dim states BEFORE the final projection (raw Whisper-derived
+        #   encoder output; what the HLD assumed). May transfer better to Qwen's space.
+        self.feature_layer = feature_layer
+        self._captured = None
+        if feature_layer == "pre_proj":
+            # capture the INPUT to encoder.proj == ln_post(pooled), shape [T, d_model=1280]
+            encoder.proj.register_forward_pre_hook(self._grab_proj_input)
+        elif feature_layer != "post_proj":
+            raise ValueError(f"feature_layer must be 'post_proj' or 'pre_proj', got {feature_layer!r}")
+
+    def _grab_proj_input(self, module, args):
+        self._captured = args[0]
 
     @torch.no_grad()
     def forward(self, mel: torch.Tensor, mel_mask: Optional[torch.Tensor] = None):
@@ -88,7 +102,10 @@ class OmniAudioAdapter(nn.Module):
                 input_features=feats,
                 feature_lens=torch.tensor([Li], device=mel.device),
             )
-            frames = out.last_hidden_state                          # [Ti, d_audio] (packed, B=1)
+            if self.feature_layer == "pre_proj":
+                frames = self._captured                            # [Ti, 1280] (pre-projection)
+            else:
+                frames = out.last_hidden_state                     # [Ti, 3584] (post-projection)
             if frames.dim() == 3:                                   # tolerate [1, Ti, d] variants
                 frames = frames[0]
             per_item.append(frames.float())
@@ -146,7 +163,100 @@ def _load_audio_encoder(audio_model: str, audio_cfg, dtype, hf_home: Optional[st
 
 
 # --------------------------------------------------------------------------- #
-# The seam itself
+# Split loaders — load ONLY what a step needs (Option 2: precompute vs train)
+# --------------------------------------------------------------------------- #
+def load_base(
+    cfg: FusionConfig,
+    base_model: str = "Qwen/Qwen3-VL-Embedding-2B",
+    *,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    load_in_4bit: bool = True,
+    gradient_checkpointing: bool = True,
+    d_audio: Optional[int] = None,
+):
+    """Load ONLY the frozen Qwen base (no 7B audio tower). For training from precomputed
+    frames. Returns ``(cfg, embed_tokens, base_lm, tokenizer)``; pass ``d_audio`` (the cached
+    frames' dim, e.g. 3584) so the resampler's in_proj is sized right."""
+    from transformers import AutoModel, AutoTokenizer
+
+    token = _hf_token()
+    print(f"[hf] using HF token: {'yes (' + token[:6] + '…)' if token else 'NO — set the huggingface secret'}")
+
+    quant = None
+    if load_in_4bit:
+        from transformers import BitsAndBytesConfig
+
+        quant = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+        )
+    base = AutoModel.from_pretrained(
+        base_model, trust_remote_code=True, torch_dtype=dtype, quantization_config=quant,
+        device_map={"": device} if quant is not None else None, token=token,
+    )
+    base.eval()
+    for p in base.parameters():
+        p.requires_grad_(False)
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True, token=token)
+    # Inert existing special token as the audio placeholder marker (see load_components note).
+    audio_pad_id = None
+    for cand in ("<|vision_pad|>", "<|image_pad|>", "<|video_pad|>"):
+        tid = tokenizer.convert_tokens_to_ids(cand)
+        if tid is not None and tid >= 0 and tid != tokenizer.unk_token_id:
+            audio_pad_id = tid
+            print(f"[base] audio placeholder marker = {cand} (id {tid}), reused inert; base unmodified")
+            break
+    if audio_pad_id is None:
+        tokenizer.add_special_tokens({"additional_special_tokens": [AUDIO_PAD_TOKEN]})
+        base.resize_token_embeddings(len(tokenizer))
+        audio_pad_id = tokenizer.convert_tokens_to_ids(AUDIO_PAD_TOKEN)
+
+    language_model = base.language_model
+    if gradient_checkpointing and hasattr(language_model, "gradient_checkpointing_enable"):
+        language_model.gradient_checkpointing_enable()
+    embed_tokens = base.get_input_embeddings()
+    base_lm = BaseLMAdapter(language_model)
+
+    resolved = dict(
+        d_llm=base.config.text_config.hidden_size,
+        audio_pad_id=int(audio_pad_id),
+        eos_id=int(tokenizer.eos_token_id),
+        pad_id=int(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0),
+    )
+    if d_audio is not None:
+        resolved["d_audio"] = int(d_audio)
+    cfg = replace(cfg, **resolved)
+    cfg._validate()
+    return cfg, embed_tokens, base_lm, tokenizer
+
+
+def load_audio_tower(
+    audio_model: str = "Qwen/Qwen2.5-Omni-7B",
+    *,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    audio_feature_layer: str = "post_proj",
+):
+    """Load ONLY the frozen Omni audio tower (not the 7B thinker/talker, not the base).
+    For ``precompute_frames``. Returns ``(audio_encoder, feature_extractor, d_audio)``."""
+    from transformers import AutoConfig, AutoFeatureExtractor
+
+    token = _hf_token()
+    hf_home = os.environ.get("HF_HOME")
+    acfg = AutoConfig.from_pretrained(audio_model, trust_remote_code=True, token=token)
+    audio_cfg = acfg.thinker_config.audio_config
+    d_audio = audio_cfg.d_model if audio_feature_layer == "pre_proj" else audio_cfg.output_dim
+    encoder = _load_audio_encoder(audio_model, audio_cfg, dtype, hf_home).to(device)
+    audio_encoder = OmniAudioAdapter(encoder, d_audio=d_audio, feature_layer=audio_feature_layer)
+    feature_extractor = AutoFeatureExtractor.from_pretrained(audio_model, trust_remote_code=True, token=token)
+    print(f"[audio] feature_layer={audio_feature_layer} d_audio={d_audio}")
+    return audio_encoder, feature_extractor, d_audio
+
+
+# --------------------------------------------------------------------------- #
+# The full seam — base + audio tower together (mel-path training / inference)
 # --------------------------------------------------------------------------- #
 def load_components(
     cfg: FusionConfig,
@@ -157,89 +267,17 @@ def load_components(
     dtype: torch.dtype = torch.bfloat16,
     load_in_4bit: bool = True,
     gradient_checkpointing: bool = True,
+    audio_feature_layer: str = "post_proj",
 ):
-    """Load the frozen Qwen base + Omni audio tower; return everything to build the model.
-
-    Returns ``(cfg, embed_tokens, base_lm, audio_encoder, tokenizer, feature_extractor)``
-    where cfg has resolved ``d_audio`` (3584), ``d_llm`` (2048), ``audio_pad_id``,
-    ``eos_id``, ``pad_id``. Hand the three callables straight to ``FusionEmbeddingModel``.
-    """
-    from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoFeatureExtractor
-
-    hf_home = os.environ.get("HF_HOME")
-    token = _hf_token()
-    print(f"[hf] using HF token: {'yes (' + token[:6] + '…)' if token else 'NO — set the huggingface secret'}")
-
-    # --- base: Qwen3VLModel ---
-    quant = None
-    if load_in_4bit:
-        from transformers import BitsAndBytesConfig
-
-        quant = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=dtype,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-    base = AutoModel.from_pretrained(
-        base_model,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        quantization_config=quant,
-        device_map={"": device} if quant is not None else None,
-        token=token,
+    """Load the frozen Qwen base + Omni audio tower together (composes load_base +
+    load_audio_tower). Returns ``(cfg, embed_tokens, base_lm, audio_encoder, tokenizer,
+    feature_extractor)`` with cfg's dims/ids resolved. Use for the mel path; for the
+    precomputed-frames path use load_base + load_audio_tower separately."""
+    audio_encoder, feature_extractor, d_audio = load_audio_tower(
+        audio_model, device=device, dtype=dtype, audio_feature_layer=audio_feature_layer,
     )
-    base.eval()
-    for p in base.parameters():
-        p.requires_grad_(False)
-
-    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True, token=token)
-    # Audio placeholder = an existing INERT special token used purely as a position marker.
-    # We drive language_model with inputs_embeds and OVERWRITE these positions with audio
-    # tokens, so the marker is never semantically processed (the vision path is bypassed —
-    # no pixel_values). Reusing a token avoids resizing embeddings (fragile under 4-bit) and
-    # keeps the base byte-identical — the strongest form of the MMEB-V2 regression guard.
-    audio_pad_id = None
-    for cand in ("<|vision_pad|>", "<|image_pad|>", "<|video_pad|>"):
-        tid = tokenizer.convert_tokens_to_ids(cand)
-        if tid is not None and tid >= 0 and tid != tokenizer.unk_token_id:
-            audio_pad_id = tid
-            print(f"[base] audio placeholder marker = {cand} (id {tid}), reused inert; base unmodified")
-            break
-    if audio_pad_id is None:                                        # fallback: add a token + resize
-        tokenizer.add_special_tokens({"additional_special_tokens": [AUDIO_PAD_TOKEN]})
-        base.resize_token_embeddings(len(tokenizer))
-        audio_pad_id = tokenizer.convert_tokens_to_ids(AUDIO_PAD_TOKEN)
-
-    language_model = base.language_model
-    if gradient_checkpointing and hasattr(language_model, "gradient_checkpointing_enable"):
-        # weights are frozen, but we backprop activations THROUGH the LM to reach the
-        # connector — checkpointing trades compute for a large activation-memory cut (8GB).
-        language_model.gradient_checkpointing_enable()
-    embed_tokens = base.get_input_embeddings()
-    base_lm = BaseLMAdapter(language_model)
-
-    d_llm = base.config.text_config.hidden_size
-
-    # --- audio: Qwen2_5OmniAudioEncoder (audio tower only) ---
-    acfg = AutoConfig.from_pretrained(audio_model, trust_remote_code=True, token=token)
-    audio_cfg = acfg.thinker_config.audio_config
-    d_audio = audio_cfg.output_dim                                  # 3584 (post-projection)
-    encoder = _load_audio_encoder(audio_model, audio_cfg, dtype, hf_home).to(device)
-    audio_encoder = OmniAudioAdapter(encoder, d_audio=d_audio)
-
-    feature_extractor = AutoFeatureExtractor.from_pretrained(
-        audio_model, trust_remote_code=True, token=token
+    cfg, embed_tokens, base_lm, tokenizer = load_base(
+        cfg, base_model, device=device, dtype=dtype, load_in_4bit=load_in_4bit,
+        gradient_checkpointing=gradient_checkpointing, d_audio=d_audio,
     )
-
-    # --- resolve cfg to the real dims/ids ---
-    cfg = replace(
-        cfg,
-        d_llm=d_llm,
-        d_audio=d_audio,
-        audio_pad_id=int(audio_pad_id),
-        eos_id=int(tokenizer.eos_token_id),
-        pad_id=int(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0),
-    )
-    cfg._validate()
     return cfg, embed_tokens, base_lm, audio_encoder, tokenizer, feature_extractor

@@ -147,7 +147,7 @@ class FusionEmbeddingModel(nn.Module):
         cfg: FusionConfig,
         embed_tokens: nn.Module,
         base_lm: Callable[..., torch.Tensor],
-        audio_encoder: Callable[..., tuple],
+        audio_encoder: Optional[Callable[..., tuple]] = None,
     ):
         super().__init__()
         if cfg.audio_pad_id < 0 or cfg.eos_id < 0:
@@ -155,6 +155,9 @@ class FusionEmbeddingModel(nn.Module):
         self.cfg = cfg
         self.embed_tokens = embed_tokens
         self.base_lm = base_lm
+        # audio_encoder is optional: when training from PRECOMPUTED frames (Option 2), the
+        # frozen tower isn't needed at train time — batches carry "frames" and go straight
+        # to the resampler. It's required only for the mel path (audio_tokens).
         self.audio_encoder = audio_encoder
         self.resampler = FusionResampler(cfg)
 
@@ -194,7 +197,20 @@ class FusionEmbeddingModel(nn.Module):
     # ------------------------------ audio path ----------------------------- #
     def audio_tokens(self, mel: torch.Tensor, mel_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Single 30 s window: mel [B,n_mels,F] -> N latent tokens [B,N,d_llm]."""
+        if self.audio_encoder is None:
+            raise RuntimeError(
+                "audio_tokens() needs a real audio_encoder; this model was built for the "
+                "precomputed-frames path (use audio_tokens_from_frames / a batch with 'frames')."
+            )
         frames, frame_mask = self.audio_encoder(mel, mel_mask)     # [B,T,d_audio], [B,T]
+        return self.resampler(frames, frame_mask)
+
+    def audio_tokens_from_frames(self, frames: torch.Tensor, frame_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Precomputed frozen-encoder frames [B,T,d_audio] -> N latent tokens [B,N,d_llm].
+
+        Skips the (frozen) audio encoder entirely — the Option 2 fast path. Since the encoder
+        never changes, its output is cached once; training then runs only the connector + LLM.
+        """
         return self.resampler(frames, frame_mask)
 
     def audio_tokens_windows(
@@ -275,7 +291,9 @@ class FusionEmbeddingModel(nn.Module):
         The loss tiles over MRL rungs (truncate+renorm internally), so we hand it the
         un-truncated, un-normalized pooled vectors plus ``logit_scale``.
         """
-        if "mel_windows" in batch:
+        if "frames" in batch:                                      # Option 2 precomputed-frames fast path
+            audio_tok = self.audio_tokens_from_frames(batch["frames"], batch.get("frame_mask"))
+        elif "mel_windows" in batch:
             audio_tok, _ = self.audio_tokens_windows(
                 batch["mel_windows"], batch["window_mask"], batch.get("mel_mask")
             )

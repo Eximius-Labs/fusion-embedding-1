@@ -58,7 +58,13 @@ image = (
 app = modal.App(APP_NAME, image=image)
 
 # Shared env so every function caches HF downloads onto the Volume, not the ephemeral disk.
-HF_ENV = {"HF_HOME": HF_CACHE, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
+# HF_XET_HIGH_PERFORMANCE is the current fast-transfer backend (Xet); the old
+# HF_HUB_ENABLE_HF_TRANSFER flag is deprecated (hf_transfer is no longer used). hf_xet ships
+# in the image, so this actually enables faster weight/dataset pulls.
+# FUSION_DATA_ROOT makes fusion_embedding.paths resolve features/frames/checkpoints to the
+# Volume here — and to a local dir / mounted bucket off Modal. One env var = provider-portable.
+HF_ENV = {"HF_HOME": HF_CACHE, "HF_XET_HIGH_PERFORMANCE": "1", "FUSION_DATA_ROOT": VOL,
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
 
 BASE_MODEL = "Qwen/Qwen3-VL-Embedding-2B"
 AUDIO_MODEL = "Qwen/Qwen2.5-Omni-7B"
@@ -330,6 +336,44 @@ def introspect_encoder() -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# 0e. find_audio_dataset — STREAMING peek at candidate caption datasets (no full
+#     download): which load, their columns, and a sample caption. Picks the repo
+#     + columns for `preprocess` without burning full-download runs.
+# --------------------------------------------------------------------------- #
+@app.function(secrets=[hf_secret], cpu=2.0, timeout=900, env=HF_ENV)
+def find_audio_dataset() -> dict:
+    import os
+    from datasets import load_dataset
+
+    from datasets import Audio
+
+    token = os.environ.get("HF_TOKEN") or None
+    candidates = [
+        ("OpenSound/AudioCaps", "train"),
+        ("OpenSound/AudioCaps", "test"),
+    ]
+    report = {}
+    for repo, split in candidates:
+        try:
+            ds = load_dataset(repo, split=split, streaming=True, token=token)
+            feats = list(ds.features) if ds.features else None
+            if feats and "audio" in feats:                 # avoid torchcodec on peek
+                ds = ds.cast_column("audio", Audio(decode=False))
+            sample = next(iter(ds))
+            # show non-audio fields (strings) so we can spot caption columns
+            text_fields = {k: (str(v)[:80]) for k, v in sample.items()
+                           if isinstance(v, (str, int, float, list)) and k != "audio"}
+            report[repo] = {"split": split, "features": feats, "sample_text_fields": text_fields}
+            print(f"OK  {repo}:{split}  features={feats}")
+        except Exception as e:  # noqa: BLE001
+            report[repo] = f"ERR: {type(e).__name__}: {str(e)[:160]}"
+            print(f"FAIL {repo}: {str(e)[:120]}")
+    import json
+    print("DATASET REPORT:\n" + json.dumps(report, indent=2, default=str))
+    return report
+
+
+# --------------------------------------------------------------------------- #
 # 1. warm_cache — pull the frozen Qwen weights onto the Volume once, so every
 #    later GPU run mounts them instantly instead of re-downloading.
 # --------------------------------------------------------------------------- #
@@ -354,21 +398,22 @@ def warm_cache() -> dict:
 # --------------------------------------------------------------------------- #
 @app.function(volumes={VOL: volume}, secrets=[hf_secret], cpu=4.0, memory=16384, timeout=3600, env=HF_ENV)
 def preprocess(
-    shard: str = "esc50",
-    dataset_repo: str = "ashraq/esc50",
+    shard: str = "audiocaps",
+    dataset_repo: str = "OpenSound/AudioCaps",
     split: str = "train",
-    limit: int = 400,
+    limit: int = 1200,
     audio_col: str = "audio",
-    text_col: str = "category",
+    text_col: str = "caption",
     task: str = "sound",
 ) -> dict:
     """Decode a real audio↔text dataset -> Whisper mel -> per-clip ``.pt`` on the Volume.
 
-    Default = ESC-50 (2000 env-sound clips, 50 classes; class name is the caption). The
-    GPU never decodes audio — that cost is paid here once. The real Omni WhisperFeatureExtractor
-    is used so the mel matches exactly what the frozen audio tower expects.
+    Default = AudioCaps (rich, UNIQUE per-clip captions -> clean contrastive, no class
+    collisions). The GPU never decodes audio — that cost is paid here once. The real Omni
+    WhisperFeatureExtractor is used so the mel matches what the frozen audio tower expects.
     """
     import io
+    import itertools
     import os
 
     import librosa
@@ -382,12 +427,11 @@ def preprocess(
     fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True, token=token)
     sr = fe.sampling_rate
 
-    ds = load_dataset(dataset_repo, split=split, token=token)
-    print(f"loaded {dataset_repo}:{split} | {len(ds)} rows | features: {list(ds.features)}")
-    # decode=False -> get raw bytes/path and decode with soundfile (avoids torchcodec dep)
-    ds = ds.cast_column(audio_col, Audio(decode=False))
-    if limit and limit < len(ds):
-        ds = ds.select(range(limit))
+    # STREAMING: pull only the `limit` clips we consume (the full split is ~49K clips / many GB).
+    ds = load_dataset(dataset_repo, split=split, streaming=True, token=token)
+    print(f"streaming {dataset_repo}:{split} | features: {list(ds.features)}")
+    ds = ds.cast_column(audio_col, Audio(decode=False))    # raw bytes -> soundfile (no torchcodec)
+    ds = itertools.islice(ds, limit)
 
     def decode_wav(a) -> np.ndarray:
         if a.get("bytes"):
@@ -416,7 +460,7 @@ def preprocess(
                    f"{out_dir}/item-{i:05d}.pt")
         n += 1
         if i % 100 == 0:
-            print(f"  {i}/{len(ds)}  '{caption}'  mel{tuple(mel.shape)}")
+            print(f"  {i}/{limit}  '{caption[:50]}'  mel{tuple(mel.shape)}")
     volume.commit()
     print(f"preprocessed {n} clips -> {out_dir}")
     return {"shard": shard, "count": n, "dir": out_dir, "dataset": dataset_repo}
@@ -632,18 +676,21 @@ class _HFTok:
 # --------------------------------------------------------------------------- #
 @app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=6 * 3600, env=HF_ENV)
 def train_p1_real(
-    shard: str = "esc50",
-    steps: int = 600,
+    shard: str = "audiocaps",
+    steps: int = 800,
     batch_size: int = 8,
-    bank_capacity: int = 2048,
+    bank_capacity: int = 4096,
+    eval_size: int = 200,
+    use_bank: bool = True,
+    audio_feature_layer: str = "post_proj",
     load_in_4bit: bool = True,
     gpu_note: str = "",
 ) -> dict:
     """Stage-1 connector training on real cached audio↔text features (HLD §7 P1 gate).
 
-    Eval uses a UNIQUE-caption subset (ESC-50 reuses class names across clips, which would
-    break diagonal-GT retrieval), so R@1 = "does a clip's embedding retrieve its class name
-    among all distinct classes". Checkpoints the connector (+temp) to the Volume.
+    Held-out eval = up to ``eval_size`` clips with DISTINCT captions (so diagonal-GT
+    retrieval is well-posed); training uses every remaining clip. R@1 = "does a held-out
+    clip's audio retrieve its own caption among the eval set". Checkpoints connector+temp.
     """
     import glob
     import itertools
@@ -671,20 +718,24 @@ def train_p1_real(
         raise RuntimeError(f"no features in {feat_dir} — run preprocess first")
     print(f"{len(paths)} cached clips in {feat_dir}")
 
-    # unique-caption eval subset (one clip per distinct caption)
-    seen, eval_paths, train_paths = set(), [], []
+    # Held-out eval: up to `eval_size` clips with DISTINCT captions (well-posed diagonal GT);
+    # everything else trains. Works for unique-caption (AudioCaps) and label-caption (ESC-50).
+    eval_caps, eval_paths, train_paths = set(), [], []
     for p in paths:
         cap = torch.load(p, map_location="cpu", weights_only=False)["text"]
-        (eval_paths if cap not in seen else train_paths).append(p)
-        seen.add(cap)
-    print(f"train={len(train_paths)} eval(unique-caption)={len(eval_paths)} distinct_captions={len(seen)}")
+        if len(eval_paths) < eval_size and cap not in eval_caps:
+            eval_paths.append(p); eval_caps.add(cap)
+        else:
+            train_paths.append(p)
+    print(f"train={len(train_paths)} eval(held-out, unique-caption)={len(eval_paths)}")
 
     # --- real frozen base ---
     cfg0 = FusionConfig(n_query=64, d_resampler=256, lambda_coral=0.05, max_steps=steps)
     cfg, embed_tokens, base_lm, audio_encoder, tokenizer, _fe = load_components(
         cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit, gradient_checkpointing=True,
+        audio_feature_layer=audio_feature_layer,
     )
-    print(f"dims: d_llm={cfg.d_llm} d_audio={cfg.d_audio} audio_pad_id={cfg.audio_pad_id}")
+    print(f"dims: d_llm={cfg.d_llm} d_audio={cfg.d_audio} feat={audio_feature_layer} audio_pad_id={cfg.audio_pad_id}")
 
     model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder)
     model.resampler.to(dev).float()
@@ -709,14 +760,15 @@ def train_p1_real(
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
         batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in next(di).items()}
-        bt = bank.get()
+        bt = bank.get() if use_bank else None
         out = model(batch)
         loss, m = loss_fn(out["audio"], out["text"], out["logit_scale"], bank_text=bt)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(model.trainable_parameters()), cfg.grad_clip)
         opt.step()
         sched.step()
-        bank.enqueue(out["text"].detach())
+        if use_bank:
+            bank.enqueue(out["text"].detach())
         if step % 25 == 0 or step == steps - 1:
             hist.append({"step": step, "loss": float(loss), "acc": float(m["acc_a2t"])})
             print(f"step {step:>4} loss {float(loss):.4f} acc {float(m['acc_a2t']):.3f} lr {sched.get_last_lr()[0]:.2e}")
@@ -726,24 +778,212 @@ def train_p1_real(
     rep = retrieval_report(a, t)
     drift = guard.max_drift(model)
 
-    ckpt = f"{CKPTS}/p1_{shard}_step{steps}.pt"
+    ckpt = f"{CKPTS}/p1_{shard}_{audio_feature_layer}_step{steps}.pt"
     os.makedirs(CKPTS, exist_ok=True)
     torch.save({"resampler": model.resampler.state_dict(),
                 "logit_scale": model.logit_scale.detach().cpu(),
-                "config": cfg.__dict__, "shard": shard, "steps": steps}, ckpt)
+                "config": cfg.__dict__, "shard": shard, "steps": steps,
+                "audio_feature_layer": audio_feature_layer}, ckpt)
     volume.commit()
 
     result = {
         "gpu": torch.cuda.get_device_name(0),
-        "shard": shard, "n_train": len(train_paths), "n_eval": len(eval_paths),
+        "shard": shard, "feat": audio_feature_layer, "d_audio": cfg.d_audio,
+        "n_train": len(train_paths), "n_eval": len(eval_paths),
         "loss_first": hist[0]["loss"], "loss_last": hist[-1]["loss"],
         "a2t_R@1": rep["a2t_R@1"], "a2t_R@10": rep["a2t_R@10"],
         "t2a_R@1": rep["t2a_R@1"],
         "base_drift": drift, "peak_vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
         "ckpt": ckpt,
     }
+    # persist the result to the Volume so detached runs are retrievable via read_results
+    import json
+    res_path = f"{CKPTS}/result_{shard}_{audio_feature_layer}_step{steps}.json"
+    with open(res_path, "w") as fh:
+        json.dump(result, fh, indent=2)
+    volume.commit()
+
     assert drift == 0.0, f"BASE LEAKED: {drift}"
     print("TRAIN_P1_REAL:", result)
+    return result
+
+
+@app.function(volumes={VOL: volume}, timeout=300)
+def read_results() -> list:
+    """Print every training result JSON on the Volume (for retrieving detached runs)."""
+    import glob
+    import json
+    import os
+
+    out = []
+    for p in sorted(glob.glob(f"{CKPTS}/result_*.json")):
+        with open(p) as fh:
+            r = json.load(fh)
+        out.append(r)
+        print(f"{os.path.basename(p)}: R@1={r.get('a2t_R@1')} R@10={r.get('a2t_R@10')} "
+              f"feat={r.get('feat')} loss {r.get('loss_first')}->{r.get('loss_last')} drift={r.get('base_drift')}")
+    if not out:
+        print("no results yet")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 6. precompute_frames — run the FROZEN audio tower ONCE over cached mel; cache
+#    the frames. Training then skips the encoder entirely (the big Option 2 win).
+# --------------------------------------------------------------------------- #
+@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=6 * 3600, env=HF_ENV)
+def precompute_frames(mel_shard: str = "audiocaps4k", frame_shard: str = "",
+                      audio_feature_layer: str = "post_proj", batch: int = 16) -> dict:
+    import glob
+    import torch
+    from fusion_embedding.hf_components import load_audio_tower
+    from fusion_embedding.paths import features_dir, frames_dir
+
+    dev = "cuda"
+    frame_shard = frame_shard or f"{mel_shard}_{audio_feature_layer}"
+    enc, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16,
+                                         audio_feature_layer=audio_feature_layer)
+    paths = sorted(glob.glob(str(features_dir(mel_shard) / "*.pt")))
+    out_dir = frames_dir(frame_shard)
+    print(f"encoding {len(paths)} clips -> frames d_audio={d_audio} -> {out_dir}")
+
+    n = 0
+    index = []                                                  # lightweight [{file, caption}] for fast splits
+    for start in range(0, len(paths), batch):
+        chunk = paths[start:start + batch]
+        recs = [torch.load(p, map_location="cpu", weights_only=False) for p in chunk]
+        mels = [r["mel"] for r in recs]
+        n_mels = mels[0].shape[0]
+        Fmax = max(m.shape[1] for m in mels)
+        mb = torch.zeros(len(mels), n_mels, Fmax, device=dev)
+        mm = torch.zeros(len(mels), Fmax, dtype=torch.bool, device=dev)
+        for i, m in enumerate(mels):
+            mb[i, :, : m.shape[1]] = m.to(dev); mm[i, : m.shape[1]] = True
+        frames, fmask = enc(mb, mm)                              # [B,T,d_audio], [B,T]
+        for i, r in enumerate(recs):
+            t = int(fmask[i].sum().item())
+            fname = f"item-{start + i:05d}.pt"
+            torch.save({"frames": frames[i, :t].cpu().contiguous(), "text": r["text"], "task": r["task"]},
+                       str(out_dir / fname))
+            index.append({"file": fname, "caption": r["text"], "task": r["task"]})
+            n += 1
+        if start % (batch * 20) == 0:
+            print(f"  {n}/{len(paths)}")
+    import json
+    with open(str(out_dir / "index.json"), "w") as fh:          # captions without loading tensors
+        json.dump({"d_audio": d_audio, "items": index}, fh)
+    volume.commit()
+    print(f"cached {n} frame files (+ index.json) -> {out_dir}")
+    return {"frame_shard": frame_shard, "count": n, "d_audio": d_audio, "dir": str(out_dir)}
+
+
+# --------------------------------------------------------------------------- #
+# 7. train_frames — train the connector on PRECOMPUTED frames (base only, no 7B
+#    tower). Much faster/step -> bigger batch + longer schedule for real P1.
+# --------------------------------------------------------------------------- #
+@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=12 * 3600,
+              memory=32768, env=HF_ENV)
+def train_frames(frame_shard: str = "audiocaps4k_post_proj", steps: int = 2000,
+                 batch_size: int = 32, eval_size: int = 200, lambda_coral: float = 0.05,
+                 load_in_4bit: bool = True, gpu_note: str = "") -> dict:
+    import glob
+    import itertools
+    import json
+
+    import torch
+    from torch.utils.data import DataLoader
+
+    from fusion_embedding.config import FusionConfig
+    from fusion_embedding.model import FusionEmbeddingModel
+    from fusion_embedding.losses import FusionContrastiveLoss
+    from fusion_embedding.data import InMemoryFrameDataset, FrameCollator
+    from fusion_embedding.hf_components import load_base
+    from fusion_embedding.paths import frames_dir, checkpoints_dir
+    from fusion_embedding.train_stage1 import (
+        RegressionGuard, build_optimizer, build_scheduler, encode_dataset, retrieval_report,
+    )
+
+    dev = "cuda"
+    print(f"GPU: {torch.cuda.get_device_name(0)} {gpu_note}")
+    fdir = frames_dir(frame_shard)
+    idx_path = fdir / "index.json"
+    if not idx_path.exists():
+        raise RuntimeError(f"no index.json in {fdir} — run precompute_frames first")
+    with open(str(idx_path)) as fh:
+        index = json.load(fh)
+    d_audio = int(index["d_audio"])
+    print(f"{len(index['items'])} frame clips | d_audio={d_audio}")
+
+    # held-out unique-caption eval; rest trains — using the lightweight index (no tensor loads)
+    eval_caps, eval_paths, train_paths = set(), [], []
+    for it in index["items"]:
+        p = str(fdir / it["file"]); cap = it["caption"]
+        if len(eval_paths) < eval_size and cap not in eval_caps:
+            eval_paths.append(p); eval_caps.add(cap)
+        else:
+            train_paths.append(p)
+    print(f"train={len(train_paths)} eval={len(eval_paths)}")
+
+    cfg0 = FusionConfig(n_query=64, d_resampler=256, lambda_coral=lambda_coral, max_steps=steps)
+    cfg, embed_tokens, base_lm, tokenizer = load_base(
+        cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit,
+        gradient_checkpointing=True, d_audio=d_audio)
+    print(f"dims: d_llm={cfg.d_llm} d_audio={cfg.d_audio}")
+
+    model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder=None)  # no tower at train time
+    model.resampler.to(dev).float()
+    if isinstance(model.logit_scale, torch.nn.Parameter):
+        model.logit_scale.data = model.logit_scale.data.to(dev)
+
+    collator = FrameCollator(cfg, _HFTok(tokenizer, cfg))
+    # Preload frames into RAM once (frames are ~7x mel; per-step Volume reads starve the GPU).
+    print("preloading frames into RAM...", flush=True)
+    train_ds = InMemoryFrameDataset.from_paths(train_paths, half=True, log_every=500)
+    eval_ds = InMemoryFrameDataset.from_paths(eval_paths, half=True)
+    print(f"preloaded train={len(train_ds)} eval={len(eval_ds)}")
+    loader = DataLoader(train_ds, batch_size=batch_size, collate_fn=collator,
+                        shuffle=True, drop_last=True)
+    loss_fn = FusionContrastiveLoss(cfg)
+    opt = build_optimizer(model, cfg)
+    sched = build_scheduler(opt, cfg, steps)
+    guard = RegressionGuard(model)
+
+    model.train()
+    di = itertools.cycle(loader)
+    torch.cuda.reset_peak_memory_stats()
+    hist = []
+    for step in range(steps):
+        opt.zero_grad(set_to_none=True)
+        batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in next(di).items()}
+        out = model(batch)
+        loss, m = loss_fn(out["audio"], out["text"], out["logit_scale"])   # big batch = many real negs
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(list(model.trainable_parameters()), cfg.grad_clip)
+        opt.step(); sched.step()
+        if step % 50 == 0 or step == steps - 1:
+            hist.append({"step": step, "loss": float(loss), "acc": float(m["acc_a2t"])})
+            print(f"step {step:>4} loss {float(loss):.4f} acc {float(m['acc_a2t']):.3f} lr {sched.get_last_lr()[0]:.2e}")
+
+    a, t = encode_dataset(model, eval_ds, collator, device=dev)
+    rep = retrieval_report(a, t)
+    drift = guard.max_drift(model)
+    ckpt = str(checkpoints_dir() / f"p1frames_{frame_shard}_step{steps}.pt")
+    torch.save({"resampler": model.resampler.state_dict(),
+                "logit_scale": model.logit_scale.detach().cpu(),
+                "config": cfg.__dict__, "frame_shard": frame_shard, "steps": steps}, ckpt)
+    result = {
+        "gpu": torch.cuda.get_device_name(0), "frame_shard": frame_shard, "d_audio": d_audio,
+        "n_train": len(train_paths), "n_eval": len(eval_paths),
+        "loss_first": hist[0]["loss"], "loss_last": hist[-1]["loss"],
+        "a2t_R@1": rep["a2t_R@1"], "a2t_R@10": rep["a2t_R@10"], "t2a_R@1": rep["t2a_R@1"],
+        "base_drift": drift, "peak_vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
+        "ckpt": ckpt,
+    }
+    with open(str(checkpoints_dir() / f"result_frames_{frame_shard}_step{steps}.json"), "w") as fh:
+        json.dump(result, fh, indent=2)
+    volume.commit()
+    assert drift == 0.0, f"BASE LEAKED: {drift}"
+    print("TRAIN_FRAMES:", result)
     return result
 
 
