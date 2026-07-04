@@ -165,6 +165,17 @@ def _load_audio_encoder(audio_model: str, audio_cfg, dtype, hf_home: Optional[st
 # --------------------------------------------------------------------------- #
 # Split loaders — load ONLY what a step needs (Option 2: precompute vs train)
 # --------------------------------------------------------------------------- #
+def _place_frozen_base(base, quant, device):
+    """Put the frozen base on ``device``. A 4-bit (bnb) model is already placed by
+    ``device_map={"": device}`` at load and must NOT be ``.to()``-moved (bitsandbytes errors);
+    the non-quantised path loads on CPU with ``device_map=None`` and MUST be moved explicitly —
+    otherwise ``embed_tokens`` stays on CPU and mismatches GPU inputs (bf16 crash 2026-07-02:
+    "Expected all tensors to be on the same device, cpu and cuda:0"). Returns the placed base."""
+    if quant is None:
+        return base.to(device)
+    return base
+
+
 def load_base(
     cfg: FusionConfig,
     base_model: str = "Qwen/Qwen3-VL-Embedding-2B",
@@ -198,6 +209,7 @@ def load_base(
     base.eval()
     for p in base.parameters():
         p.requires_grad_(False)
+    base = _place_frozen_base(base, quant, device)
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True, token=token)
     # Inert existing special token as the audio placeholder marker (see load_components note).

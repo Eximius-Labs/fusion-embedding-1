@@ -8,3 +8,12 @@ dist/
 .env
 .env.*
 !.env.example
+
+# Internal docs / research findings — kept local, not tracked
+docs/
+
+# Eval / training result JSONs — local artifacts, not tracked
+results/
+
+# Claude Code local session/config — not tracked
+.claude/

@@ -69,6 +69,16 @@ class FusionConfig:
     lambda_coral: float = 0.05   # light in P1, raised in P2
     debias_gamma: float = 0.0    # P1 off; P2 ~0.1 (debiased contrastive)
     use_hard_negatives: bool = False  # P1 off; P2 mines hard negatives
+    # Relevance-aware loss (floor-audit follow-ups; 0 = off = exact legacy loss).
+    # fn_mask_threshold: whitened-cos τ above which a different-string pair is treated as an
+    # unlabeled positive and dropped from the denominator (measured: must be ≥ ~0.98 — real
+    # distinctions like "woman/man gives a speech" sit at 0.976). Applies to the bank always,
+    # to in-batch negatives only when soft_label_beta == 0.
+    fn_mask_threshold: float = 0.0
+    # soft_label_beta: Wu et al. 2023 soft-label InfoNCE mixing (β≈0.3): targets =
+    # (1-β)·onehot + β·text-similarity distribution over the in-batch columns.
+    soft_label_beta: float = 0.0
+    fn_mask_dim: Optional[int] = None   # rung for the relevance similarity (None => mrl_default)
 
     # --- Optimization (HLD §5.3) ---
     lr: float = 1e-4

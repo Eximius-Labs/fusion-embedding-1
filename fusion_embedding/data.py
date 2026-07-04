@@ -13,11 +13,12 @@ Two interchangeable backends behind the same interface:
 from __future__ import annotations
 
 import hashlib
+import random
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Protocol, Sequence
+from typing import Callable, Iterable, Optional, Protocol, Sequence
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from .config import FusionConfig, TASK_INSTRUCTIONS, TASK_KEYS
 
@@ -207,12 +208,150 @@ class InMemoryFrameDataset(Dataset):
         task = d.get("task", "sound")
         if task not in TASK_INSTRUCTIONS:
             task = "sound"
-        return {
+        rec = {
             "frames": d["frames"].float(),
             "text": d["text"],
             "task": task,
             "instruction": instruction_for(task),
         }
+        if d.get("text_emb") is not None:                         # cached RAW text (Step 2), if present
+            rec["text_emb"] = d["text_emb"].float()
+        return rec
+
+
+# ---------------------------------------------------------------------------- #
+# Sharded frames: many clips per file → one big sequential read, no per-clip
+# network round-trips, no full-RAM preload. Replaces the per-clip `.pt` + preload
+# path for large corpora (the read bottleneck was per-file latency, not bandwidth).
+# ---------------------------------------------------------------------------- #
+def write_frame_shard(path, records: Sequence[dict], half: bool = True) -> None:
+    """Write a list of ``{frames, text, task}`` as ONE shard file (parallel lists).
+
+    ``half`` stores frames as fp16 (halves shard size / read cost; cast back to float at use).
+    """
+    frames = [(r["frames"].half() if half else r["frames"]).contiguous() for r in records]
+    torch.save({"frames": frames,
+                "text": [r["text"] for r in records],
+                "task": [r.get("task", "sound") for r in records]}, str(path))
+
+
+def text_emb_shard_path(frame_shard_path) -> str:
+    """Sibling path holding a frame shard's precomputed RAW text embeddings (Step 2 cache).
+
+    Kept SEPARATE from the frame shard on disk (``shard-0000.pt`` → ``shard-0000.txtemb.pt``) but
+    joined by clip position, so the text cache can be (re)built independently of the frames.
+    """
+    p = str(frame_shard_path)
+    return p[:-3] + ".txtemb.pt" if p.endswith(".pt") else p + ".txtemb.pt"
+
+
+def write_text_emb_shard(frame_shard_path, embs: torch.Tensor) -> None:
+    """Write ``[n_clips, d_llm]`` fp16 RAW (pre-whitening) text embeddings beside a frame shard."""
+    torch.save({"text_emb": embs.half().contiguous()}, text_emb_shard_path(frame_shard_path))
+
+
+def _shard_record(shard: dict, off: int, text_embs: Optional[torch.Tensor] = None) -> dict:
+    task = shard["task"][off]
+    if task not in TASK_INSTRUCTIONS:
+        task = "sound"
+    rec = {"frames": shard["frames"][off].float(), "text": shard["text"][off],
+           "task": task, "instruction": instruction_for(task)}
+    if text_embs is not None:
+        rec["text_emb"] = text_embs[off].float()               # cached RAW pooled text (whitened at use)
+    return rec
+
+
+def shard_starts_from(n_shards: int, shard_size: int, n_total: int) -> list[int]:
+    """Global start index of each shard for a SINGLE source (only its last shard is partial)."""
+    return [min(p * shard_size, n_total) for p in range(n_shards)]
+
+
+def load_frame_clips(shard_paths: Sequence, shard_starts: Sequence[int],
+                     global_indices: Iterable[int], *, with_text_emb: bool = False) -> list[dict]:
+    """Materialise specific clips (by global index) into a list — for the small held-out eval set.
+
+    ``shard_starts[p]`` is the global index of clip 0 in shard ``p`` (robust to partial shards when
+    several sources are concatenated). Reads only the shards that actually hold a wanted clip.
+    ``with_text_emb`` also loads the sibling text-emb cache (Step 2) and attaches ``text_emb`` per clip.
+    """
+    import bisect
+    import os
+    from collections import defaultdict
+    starts = list(shard_starts)
+    by_shard: dict = defaultdict(list)
+    for g in global_indices:
+        pos = bisect.bisect_right(starts, g) - 1                 # shard whose start is ≤ g
+        by_shard[pos].append(g - starts[pos])
+    out: list[dict] = []
+    for pos in sorted(by_shard):
+        shard = torch.load(str(shard_paths[pos]), map_location="cpu", weights_only=False)
+        tembs = None
+        if with_text_emb:
+            tp = text_emb_shard_path(shard_paths[pos])
+            if not os.path.exists(tp):
+                raise FileNotFoundError(f"text cache missing: {tp} — run precompute_text_cache first")
+            tembs = torch.load(tp, map_location="cpu", weights_only=False)["text_emb"]
+        for off in sorted(by_shard[pos]):
+            out.append(_shard_record(shard, off, tembs))
+    return out
+
+
+class ShardedFrameDataset(IterableDataset):
+    """Streams frames from N-clip shard files with a reservoir shuffle buffer.
+
+    One ``torch.load`` per shard is a single big sequential read (hundreds of clips), so this
+    avoids both the full-RAM preload and the per-clip network latency of ``CachedFrameDataset``.
+    ``shard_starts[p]`` gives the global index of shard ``p``'s first clip (so several sources'
+    shards can be concatenated even with partial last shards); ``exclude`` is a set of those global
+    indices to skip (the held-out eval clips). Shards are split disjointly across DataLoader workers,
+    and re-iterating yields a fresh (reshuffled) pass. Emits ``{frames, text, task, instruction}``.
+    """
+
+    def __init__(self, shard_paths: Sequence, shard_starts: Sequence[int], *,
+                 exclude: Optional[set] = None, shuffle_buffer: int = 2048,
+                 shuffle_shards: bool = True, seed: int = 0, use_text_emb: bool = False):
+        self.shard_paths = [str(p) for p in shard_paths]
+        self.shard_starts = list(shard_starts)
+        self.exclude = set(exclude or ())
+        self.shuffle_buffer = max(1, shuffle_buffer)
+        self.shuffle_shards = shuffle_shards
+        self.seed = seed
+        self.use_text_emb = use_text_emb                          # attach cached RAW text (Step 2)
+        self._epoch = 0
+
+    def __iter__(self):
+        worker = get_worker_info()
+        wid = worker.id if worker is not None else 0
+        nworkers = worker.num_workers if worker is not None else 1
+        order = list(range(len(self.shard_paths)))
+        if self.shuffle_shards:
+            random.Random(self.seed + self._epoch).shuffle(order)
+        self._epoch += 1
+        order = order[wid::nworkers]                              # disjoint shard subset per worker
+        buf_rng = random.Random(self.seed * 7919 + wid + self._epoch)
+        buffer: list = []
+        for pos in order:
+            shard = torch.load(self.shard_paths[pos], map_location="cpu", weights_only=False)
+            tembs = None
+            if self.use_text_emb:
+                import os
+                tp = text_emb_shard_path(self.shard_paths[pos])
+                if not os.path.exists(tp):
+                    raise FileNotFoundError(f"text cache missing: {tp} — run precompute_text_cache first")
+                tembs = torch.load(tp, map_location="cpu", weights_only=False)["text_emb"]
+            start = self.shard_starts[pos]
+            for off in range(len(shard["text"])):
+                if (start + off) in self.exclude:
+                    continue
+                rec = _shard_record(shard, off, tembs)
+                if len(buffer) < self.shuffle_buffer:
+                    buffer.append(rec)
+                else:
+                    j = buf_rng.randrange(len(buffer))
+                    buffer[j], rec = rec, buffer[j]
+                    yield rec
+        buf_rng.shuffle(buffer)
+        yield from buffer
 
 
 class FusionAudioTextManifest(Dataset):
@@ -319,7 +458,7 @@ class FrameCollator(FusionCollator):
         frames, frame_mask = self._pad_frames([it["frames"] for it in items])
         audio_ids, audio_mask = self._audio_token_ids(len(items))
         text_ids, text_mask = self._text_ids(items)
-        return {
+        batch = {
             "frames": frames,
             "frame_mask": frame_mask,
             "audio_input_ids": audio_ids,
@@ -327,7 +466,11 @@ class FrameCollator(FusionCollator):
             "text_input_ids": text_ids,
             "text_attention_mask": text_mask,
             "tasks": [it["task"] for it in items],
+            "texts": [it["text"] for it in items],   # raw captions (bank own-positive masking)
         }
+        if all(it.get("text_emb") is not None for it in items):  # Step 2: RAW text cache → skip base
+            batch["text_emb_cached"] = torch.stack([it["text_emb"] for it in items])
+        return batch
 
 
 # ---------------------------------------------------------------------------- #

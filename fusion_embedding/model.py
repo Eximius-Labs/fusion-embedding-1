@@ -57,6 +57,47 @@ def mrl_truncate_normalize(x: torch.Tensor, dim: int) -> torch.Tensor:
     return F.normalize(x[..., :dim], p=2, dim=-1)
 
 
+class TextWhitening(nn.Module):
+    """Per-dimension standardization of the frozen text embeddings (mean-center + std-normalize).
+
+    Decoder-LM text spaces are severely anisotropic — we *measured* random AudioCaps caption pairs
+    at cosine ≈0.9+ in the frozen Qwen space (see docs/data_strategy.md). That inflates in-batch
+    false negatives on the frozen side, which the contrastive loss cannot correct because only the
+    trainable (audio) side gets de-anisotropized by the uniformity term. Standardizing the text side
+    removes the offending common-mode / rogue dimensions.
+
+    Diagonal (per-dim) on purpose → MRL-safe: truncating to the first ``d`` dims then whitening with
+    the first-d stats equals whitening then truncating. A full-covariance whitening would mix dims
+    and break the Matryoshka nesting, so we don't. Identity until ``fit`` is called (unfitted models
+    behave exactly as before). The stats are buffers (not Parameters) → never trained, never in the
+    optimizer, invisible to the RegressionGuard's base snapshot.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.register_buffer("mean", torch.zeros(dim))
+        self.register_buffer("std", torch.ones(dim))
+        self.register_buffer("fitted", torch.zeros((), dtype=torch.uint8))
+
+    @torch.no_grad()
+    def fit(self, embs: torch.Tensor, eps: float = 1e-6) -> "TextWhitening":
+        """embs [N, dim] of RAW (un-whitened) pooled text embeddings -> set per-dim mean/std."""
+        embs = embs.float()
+        self.mean.copy_(embs.mean(dim=0))
+        self.std.copy_(embs.std(dim=0).clamp_min(eps))
+        self.fitted.fill_(1)
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if int(self.fitted) == 0:
+            return x
+        # Follow x's device+dtype: the frozen-frames training path moves only the resampler to the
+        # GPU, so these buffers can legitimately live on a different device than the text embeddings.
+        mean = self.mean.to(device=x.device, dtype=x.dtype)
+        std = self.std.to(device=x.device, dtype=x.dtype)
+        return (x - mean) / std
+
+
 # ---------------------------------------------------------------------------- #
 # FusionResampler (HLD §4.2)
 # ---------------------------------------------------------------------------- #
@@ -160,6 +201,8 @@ class FusionEmbeddingModel(nn.Module):
         # to the resampler. It's required only for the mel path (audio_tokens).
         self.audio_encoder = audio_encoder
         self.resampler = FusionResampler(cfg)
+        # Per-dim standardization of the frozen text targets (anisotropy fix). Identity until fit.
+        self.text_whitening = TextWhitening(cfg.d_llm)
 
         scale = torch.tensor(float(cfg.logit_scale_init))
         if cfg.learnable_temperature:
@@ -268,7 +311,11 @@ class FusionEmbeddingModel(nn.Module):
 
     # ------------------------------ text path ------------------------------ #
     def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Frozen LLM over the instruction+text side -> EOS pooling. Full-dim [B,d_llm]."""
+        """Frozen LLM over the instruction+text side -> EOS pooling. Full-dim [B,d_llm].
+
+        Returns the RAW pooled vector (whitening is applied downstream in ``forward``) so that
+        ``fit_text_whitening`` can estimate stats on un-whitened embeddings regardless of fit state.
+        """
         embeds = self.embed_tokens(input_ids)
         hidden = self.base_lm(inputs_embeds=embeds, attention_mask=attention_mask)
         return last_token_pool(hidden, attention_mask)
@@ -303,10 +350,18 @@ class FusionEmbeddingModel(nn.Module):
         pooled_audio = self.encode_audio(
             batch["audio_input_ids"], batch["audio_attention_mask"], audio_tok
         )
-        pooled_text = self.encode_text(batch["text_input_ids"], batch["text_attention_mask"])
+        # Text (frozen side) is whitened; audio (trainable) learns to match the whitened targets.
+        # If RAW pooled text is precomputed (Step 2 cache), reuse it and skip the frozen-base text
+        # forward (~2× fewer base forwards/step) — identical result since encode_text is deterministic.
+        if batch.get("text_emb_cached") is not None:
+            pooled_text = self.text_whitening(batch["text_emb_cached"].to(pooled_audio.dtype))
+        else:
+            pooled_text = self.text_whitening(
+                self.encode_text(batch["text_input_ids"], batch["text_attention_mask"])
+            )
         out = {"audio": pooled_audio, "text": pooled_text, "logit_scale": self.clamped_logit_scale()}
         if "hard_neg_text_input_ids" in batch:
-            out["hard_neg_text"] = self.encode_text(
+            out["hard_neg_text"] = self.text_whitening(self.encode_text(
                 batch["hard_neg_text_input_ids"], batch["hard_neg_text_attention_mask"]
-            )
+            ))
         return out

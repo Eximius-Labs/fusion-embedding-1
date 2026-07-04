@@ -77,6 +77,74 @@ class TextMemoryBank:
         return self._buf[: self._count]
 
 
+class CorpusTextBank:
+    """Full-corpus frozen-text negative bank built from the Step-2 text cache (zero staleness).
+
+    Holds the WHITENED full-dim text embedding of every training caption (whitening is a fixed
+    diagonal transform after fit, so whitening the corpus once is exact), plus a caption→rows
+    lookup used to build the per-batch **exclusion mask**: a full-corpus bank necessarily
+    contains each batch item's own caption (and any exact-duplicate captions elsewhere in the
+    corpus) — those rows must not enter that anchor's InfoNCE denominator.
+    """
+
+    def __init__(self, embs_whitened: torch.Tensor, captions, device: str | torch.device = "cpu"):
+        if embs_whitened.size(0) != len(captions):
+            raise ValueError(f"bank rows {embs_whitened.size(0)} != captions {len(captions)}")
+        self.embs = embs_whitened.to(device)                    # [M, d_llm], whitened, un-normalized
+        self._rows_by_caption: dict = {}
+        for i, c in enumerate(captions):
+            self._rows_by_caption.setdefault(c, []).append(i)
+
+    def __len__(self) -> int:
+        return self.embs.size(0)
+
+    @property
+    def n_duplicate_captions(self) -> int:
+        """Captions appearing more than once in the corpus (each occurrence gets masked)."""
+        return sum(len(r) for r in self._rows_by_caption.values() if len(r) > 1)
+
+    def exclude_mask(self, batch_captions, device=None) -> torch.Tensor:
+        """[B, M] bool — True where the bank row matches ANY batch caption (exclude from denom).
+
+        Union semantics (same rows masked for every anchor): the batch's captions are already
+        represented as in-batch negatives/positives, so leaving them in the bank would (a) put
+        each anchor's own positive in its denominator — the poison — and (b) double-count the
+        other items' texts. The bank's job is strictly OUT-of-batch negatives.
+        """
+        rows: list = []
+        for c in set(batch_captions):
+            rows.extend(self._rows_by_caption.get(c, ()))
+        mask = torch.zeros(len(batch_captions), self.embs.size(0), dtype=torch.bool,
+                           device=device if device is not None else self.embs.device)
+        if rows:
+            mask[:, rows] = True
+        return mask
+
+
+@torch.no_grad()
+def build_corpus_bank_from_cache(shard_paths, captions, whitening, *, exclude=None,
+                                 device: str | torch.device = "cpu") -> CorpusTextBank:
+    """Assemble a ``CorpusTextBank`` from sibling ``.txtemb.pt`` caches (Step 2).
+
+    ``shard_paths``/``captions`` are the trainer's concatenated frame-shard order (bank row i
+    ↔ global clip index i before exclusion). ``exclude`` drops the held-out eval clips so eval
+    captions never appear as training negatives. ``whitening`` (fitted ``TextWhitening``) is
+    applied once, in fp32, then stored fp16 — the loss casts per-forward.
+    """
+    from .data import text_emb_shard_path
+
+    chunks = [torch.load(text_emb_shard_path(p), map_location="cpu", weights_only=False)["text_emb"]
+              for p in shard_paths]
+    raw = torch.cat(chunks)                                     # [N_total, d_llm] fp16 RAW
+    if raw.size(0) != len(captions):
+        raise ValueError(f"text cache rows {raw.size(0)} != captions {len(captions)}")
+    keep = [i for i in range(raw.size(0)) if i not in (exclude or ())]
+    kept_caps = [captions[i] for i in keep]
+    dev = torch.device(device)
+    whitened = whitening(raw[keep].to(dev).float()).half()      # fixed diagonal → exact, once
+    return CorpusTextBank(whitened, kept_caps, device=dev)
+
+
 @torch.no_grad()
 def precompute_text_bank(
     model: FusionEmbeddingModel,
