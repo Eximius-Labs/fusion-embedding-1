@@ -60,6 +60,39 @@ you inherit the base's retrieval quality exactly, and add audio on top.
   CPU stand-ins (no GPU, no `transformers`) via dependency injection at the
   model seams; 125+ unit and E2E tests.
 
+## What audio→image retrieval looks like
+
+The connector is trained **only** on audio↔text pairs — it never sees a single
+audio–image example. But because text, image, and video already share the frozen
+base's space, audio lands there too, and **audio→image retrieval emerges for free**.
+On VGGSound-696 (held out, in the training blacklist → zero leakage), the released
+preview retrieves the matching image from sound alone at **R@10 0.368 — 26× the 0.014
+random-chance rate**. Real examples:
+
+**Direct hits** — the clip's own frame comes back in the top 5, surrounded by the same kind of scene:
+
+| The sound | What it retrieved (top-5) | Exact frame |
+|---|---|---|
+| A siren | its own ambulance, then more emergency vehicles | rank 2 |
+| *"Switch on the good piece"* (speech) | the appliance being switched on | rank 1 |
+| A whirring kitchen motor | its own blender, among other mixers | rank 3 |
+| An emergency-vehicle siren | fire engines and ambulances | rank 4 |
+| Metallic clanking and banging | the kitchen it came from | rank 5 |
+
+**Right neighbourhood** — the exact frame ranks lower (often it's a poor still), but every
+top result is the correct *sound* category — the shared space placing audio among the right images:
+
+| The sound | What it retrieved (top-5) | Exact frame |
+|---|---|---|
+| A distinct click | people typing at keyboards | rank 109 |
+| A power motor | an angle grinder, a belt sander, a table saw | rank 68 |
+| A single cowbell note | cattle herds — one wearing a bell | rank 6 |
+| High squeaks and chirps | chickens, crows, a quail, a parrot | rank 104 |
+
+Scored with the released `fusion-embedding-1-2b-preview` on `mteb/VGGSound_AV_RETRIEVAL`,
+per-modality-centered geometry (see the model card for the full cross-modal table, including
+an ImageBind comparison).
+
 ## Architecture
 
 ```
@@ -212,6 +245,36 @@ uv run --env-file .env modal run modal_app.py::precompute_frames    # frozen tow
 uv run --env-file .env modal run modal_app.py::precompute_text_cache
 uv run --env-file .env modal run --detach modal_app.py::train_frames_a100  # connector training
 ```
+
+## Results — preview checkpoint (v0.1)
+
+Numbers for [`fusion-embedding-1-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
+(d=384 connector, 131K-pair training corpus). Full tables and protocol details are on the
+model card.
+
+**Audio–text retrieval** (published protocols):
+
+| Benchmark | A→T R@1 | A→T R@10 | T→A R@10 |
+|---|---|---|---|
+| AudioCaps test (883 clips, 5-ref min-rank) | 0.216 | 0.626 | 0.680 |
+| Clotho v2.1 eval, zero-shot (1,045 × 5 refs) | 0.064 | 0.252 | 0.329 |
+
+CLAP-family models that fine-tune both encoders end-to-end score higher on AudioCaps
+(A→T R@10 0.906–0.928); this model keeps both towers frozen.
+
+**Cross-modal retrieval** (VGGSound-AV, 696 pairs, chance R@10 = 0.014; this model trains
+on audio–text only — its audio↔image alignment is emergent):
+
+| Model | audio↔image | audio↔text | text↔image |
+|---|---|---|---|
+| ImageBind-Huge | **0.718 / 0.720** | 0.404 / 0.348 | 0.243 / 0.282 |
+| fusion-embedding-1-2b-preview | 0.368 / 0.388 | **0.555 / 0.592** | **0.331 / 0.319** |
+
+Full audio→image metrics (per-modality mean-centered readout): R@1 0.085, R@5 0.260,
+R@10 0.368 (26× chance), mAP@10 0.155 — with zero audio–image training pairs.
+
+Text, image, and video performance is the frozen base model's published MMEB-V2 results,
+unchanged by construction.
 
 ## Evaluation protocol
 

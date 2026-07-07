@@ -76,6 +76,36 @@ its audio–text alignment is emergent. This model trains on audio–text only; 
 audio–image alignment is emergent. Both evaluated with identical clips, frames, and
 scoring; ImageBind numbers computed with the released imagebind_huge checkpoint.*
 
+Full audio→image metrics for this model (per-modality mean-centered gallery — the readout
+implemented by `FusionEmbedder.center`; chance R@10 = 0.014):
+
+| R@1 | R@5 | R@10 | mAP@10 |
+|---|---|---|---|
+| 0.085 | 0.260 | 0.368 | 0.155 |
+
+**What audio→image retrieval looks like.** The 0.368 above is not only an aggregate — the
+retrievals are organized by sound. Real examples from this checkpoint on VGGSound-696:
+
+*Direct hits* — the clip's own frame is returned in the top 5, among the same kind of scene:
+
+| Sound | Top-5 retrieval | Exact frame |
+|---|---|---|
+| A siren | its own ambulance, then more emergency vehicles | rank 2 |
+| *"Switch on the good piece"* (speech) | the appliance being switched on | rank 1 |
+| A whirring kitchen motor | its own blender, among mixers | rank 3 |
+| An emergency-vehicle siren | fire engines and ambulances | rank 4 |
+| Metallic clanking and banging | the kitchen it came from | rank 5 |
+
+*Right neighbourhood* — the exact frame ranks lower (often a poor still), but every top
+result is the correct sound category:
+
+| Sound | Top-5 retrieval | Exact frame |
+|---|---|---|
+| A distinct click | people typing at keyboards | rank 109 |
+| A power motor | an angle grinder, a belt sander, a table saw | rank 68 |
+| A single cowbell note | cattle herds, one wearing a bell | rank 6 |
+| High squeaks and chirps | chickens, crows, a quail, a parrot | rank 104 |
+
 Text, image, and video benchmarks are the base model's published MMEB-V2 results, which
 are unaffected by this extension.
 
