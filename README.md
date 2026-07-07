@@ -327,14 +327,19 @@ fully testable without hardware.
 ## Roadmap
 
 - [x] **P0 — Infrastructure**: frozen-base wiring, eval harness, CPU-testable pipeline
-- [x] **P1 (in progress) — Audio→text alignment**: connector training at scale;
-      published-protocol eval wired into every run
-- [ ] **P2 — Hardening**: clean data, mined hard negatives, full alignment suite
-      (modality temperature, debiased contrastive)
+- [x] **P1 — Audio→text alignment**: connector training at scale, published-protocol
+      eval wired into every run; shipped as
+      [v0.1-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.1-preview)
+      (131K pairs) and
+      [v0.2-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.2-preview)
+      (484K pairs — AudioCaps A→T R@10 0.626 → 0.717, Clotho zero-shot 0.252 → 0.448)
+- [ ] **P2 (in progress) — Corpus scaling + data quality**: larger FreeSound pool,
+      relevance-aware training (soft labels, false-negative masking), model-based
+      recaptioning, domain-weighted sampling, connector capacity re-test at scale
 - [ ] **P3 — Speech parity + grounding**: heavy multilingual speech, more query
       tokens, direct audio↔video pairs
 - [ ] **P4 — Release**: pre-registered five-modality benchmark, model soup,
-      2B release; then the 8B tier
+      2B stable release; then the 8B tier
 - [ ] **Track C corpus**: self-generated, CLAP-gated captions on permissively
       licensed audio — the commercially clean training set
 
