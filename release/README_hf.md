@@ -84,7 +84,10 @@ implemented by `FusionEmbedder.center`; chance R@10 = 0.014):
 | 0.085 | 0.260 | 0.368 | 0.155 |
 
 **What audio→image retrieval looks like.** The 0.368 above is not only an aggregate — the
-retrievals are organized by sound. Real examples from this checkpoint on VGGSound-696:
+retrievals are organized by sound. Real examples from this checkpoint on VGGSound-696
+(query clip's frame left, top-5 retrieved images right; green = the clip's exact frame):
+
+![Audio-to-image retrieval examples](assets/audio_to_image_gallery.png)
 
 *Direct hits* — the clip's own frame is returned in the top 5, among the same kind of scene:
 

@@ -271,7 +271,10 @@ on audio–text only — its audio↔image alignment is emergent):
 | fusion-embedding-1-2b-preview | 0.368 / 0.388 | **0.555 / 0.592** | **0.331 / 0.319** |
 
 Full audio→image metrics (per-modality mean-centered readout): R@1 0.085, R@5 0.260,
-R@10 0.368 (26× chance), mAP@10 0.155 — with zero audio–image training pairs.
+R@10 0.368 (26× chance), mAP@10 0.155 — with zero audio–image training pairs. What that
+looks like (query clip's frame left; green = the clip's exact frame among the top 5):
+
+![Audio-to-image retrieval examples](assets/audio_to_image_gallery.png)
 
 Text, image, and video performance is the frozen base model's published MMEB-V2 results,
 unchanged by construction.
