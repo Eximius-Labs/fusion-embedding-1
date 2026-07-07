@@ -72,12 +72,15 @@ class FusionEmbedder:
 
     # ------------------------------------------------------------------ loading
     @classmethod
-    def from_pretrained(cls, repo_or_path: str, device: str = "cuda", **kw) -> "FusionEmbedder":
+    def from_pretrained(cls, repo_or_path: str, device: str = "cuda",
+                        revision: Optional[str] = None, **kw) -> "FusionEmbedder":
+        """Load from a local checkpoint path or an HF repo. ``revision`` pins a repo
+        tag/commit (e.g. ``"v0.1-preview"``, ``"v0.2-preview"``); default is latest."""
         if os.path.exists(repo_or_path):
             path = repo_or_path
         else:
             from huggingface_hub import hf_hub_download
-            path = hf_hub_download(repo_or_path, CKPT_FILE)
+            path = hf_hub_download(repo_or_path, CKPT_FILE, revision=revision)
         return cls(path, device=device, **kw)
 
     # ------------------------------------------------------------------ helpers

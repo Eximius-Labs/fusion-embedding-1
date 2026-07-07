@@ -36,9 +36,9 @@ any direction between modalities.
 - **Compact distribution.** This repository ships the connector and normalization
   statistics (~60 MB); the frozen towers are downloaded from their original repositories.
 
-This is a **research preview**, currently at **v0.2** (trained on a 484K-pair corpus;
-v0.1, trained on 131K pairs, remains available as a pinned revision). Both versions are
-compared below; pin a revision if you build on this model.
+This is a **research preview**, currently at **v0.2** (trained on a 484K-pair corpus).
+v0.1 (131K pairs) remains downloadable via the `v0.1-preview` tag; `v0.2-preview` pins
+the current version. Both are compared below; pin a tag if you build on this model.
 
 ## Evaluation
 
@@ -154,6 +154,7 @@ from inference import FusionEmbedder
 
 fe = FusionEmbedder.from_pretrained("EximiusLabs/fusion-embedding-1-2b-preview",
                                     device="cuda")
+# or pin a version: revision="v0.2-preview" (current) / "v0.1-preview"
 
 a = fe.embed_audio("dog_barking.wav")                        # [2048]
 t = fe.embed_text("a dog barks while rain falls")            # [2048]
