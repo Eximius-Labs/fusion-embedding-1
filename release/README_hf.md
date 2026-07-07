@@ -52,7 +52,7 @@ min-rank over references:
 | Cacophony | 0.553 | 0.924 | 0.864 |
 | M2D-CLAP | **0.593** | **0.928** | **0.886** |
 | fusion-embedding-1-2b-preview v0.1 | 0.216 | 0.626 | 0.680 |
-| **fusion-embedding-1-2b-preview v0.2** | 0.279 | 0.717 | 0.736 |
+| **fusion-embedding-1-2b-preview v0.2** | **0.279** | **0.717** | **0.736** |
 
 *CLAP-family models fine-tune both encoders end-to-end and include AudioCaps and Clotho
 training data; this model keeps both towers frozen and trains only the connector.*
@@ -64,7 +64,7 @@ from training data):
 |---|---|---|
 | WavCaps CNN14-BERT (zero-shot) | **0.576** | **0.549** |
 | fusion-embedding-1-2b-preview v0.1 | 0.252 | 0.329 |
-| **fusion-embedding-1-2b-preview v0.2** | 0.448 | 0.449 |
+| **fusion-embedding-1-2b-preview v0.2** | **0.448** | **0.449** |
 
 **Cross-modal retrieval** — VGGSound-AV, 696 audio/video-frame pairs (chance R@10 = 0.014).
 R@10 shown as audio-side → other / other → audio-side:
@@ -73,7 +73,7 @@ R@10 shown as audio-side → other / other → audio-side:
 |---|---|---|---|
 | ImageBind-Huge | **0.718 / 0.720** | 0.404 / 0.348 | 0.243 / 0.282 |
 | fusion-embedding-1-2b-preview v0.1 | 0.368 / 0.388 | 0.555 / 0.592 | 0.331 / 0.319 |
-| **fusion-embedding-1-2b-preview v0.2** | 0.418 / 0.440 | **0.588 / 0.631** | **0.331 / 0.319** |
+| **fusion-embedding-1-2b-preview v0.2** | **0.418 / 0.440** | **0.588 / 0.631** | **0.331 / 0.319** |
 
 *ImageBind trains directly on audio–image pairs, so that pair is its supervised direction;
 its audio–text alignment is emergent. This model trains on audio–text only; its
@@ -86,7 +86,7 @@ Full audio→image metrics (per-modality mean-centered gallery — the readout i
 | Version | R@1 | R@5 | R@10 | mAP@10 |
 |---|---|---|---|---|
 | v0.1 | 0.085 | 0.260 | 0.368 | 0.155 |
-| **v0.2** | 0.088 | 0.315 | 0.418 | 0.179 |
+| **v0.2** | **0.088** | **0.315** | **0.418** | **0.179** |
 
 **What audio→image retrieval looks like.** The 0.368 above is not only an aggregate — the
 retrievals are organized by sound. Real examples (v0.1 checkpoint) on VGGSound-696
