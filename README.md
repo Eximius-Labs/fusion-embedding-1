@@ -246,18 +246,21 @@ uv run --env-file .env modal run modal_app.py::precompute_text_cache
 uv run --env-file .env modal run --detach modal_app.py::train_frames_a100  # connector training
 ```
 
-## Results — preview checkpoint (v0.1)
+## Results — preview checkpoints
 
 Numbers for [`fusion-embedding-1-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
-(d=384 connector, 131K-pair training corpus). Full tables and protocol details are on the
-model card.
+— v0.1 (131K-pair corpus) and v0.2 (484K-pair corpus incl. the full AudioCaps train split
+and a 318K LAION-FreeSound subset), same d=384 connector. Full tables and protocol details
+are on the model card.
 
 **Audio–text retrieval** (published protocols):
 
-| Benchmark | A→T R@1 | A→T R@10 | T→A R@10 |
-|---|---|---|---|
-| AudioCaps test (883 clips, 5-ref min-rank) | 0.216 | 0.626 | 0.680 |
-| Clotho v2.1 eval, zero-shot (1,045 × 5 refs) | 0.064 | 0.252 | 0.329 |
+| Benchmark | Version | A→T R@1 | A→T R@10 | T→A R@10 |
+|---|---|---|---|---|
+| AudioCaps test (883 clips, 5-ref min-rank) | v0.1 | 0.216 | 0.626 | 0.680 |
+| AudioCaps test | **v0.2** | **0.279** | **0.717** | **0.736** |
+| Clotho v2.1 eval, zero-shot (1,045 × 5 refs) | v0.1 | 0.064 | 0.252 | 0.329 |
+| Clotho v2.1 eval, zero-shot | **v0.2** | **0.135** | **0.448** | **0.449** |
 
 CLAP-family models that fine-tune both encoders end-to-end score higher on AudioCaps
 (A→T R@10 0.906–0.928); this model keeps both towers frozen.
@@ -268,11 +271,13 @@ on audio–text only — its audio↔image alignment is emergent):
 | Model | audio↔image | audio↔text | text↔image |
 |---|---|---|---|
 | ImageBind-Huge | **0.718 / 0.720** | 0.404 / 0.348 | 0.243 / 0.282 |
-| fusion-embedding-1-2b-preview | 0.368 / 0.388 | **0.555 / 0.592** | **0.331 / 0.319** |
+| fusion-embedding-1-2b-preview v0.1 | 0.368 / 0.388 | 0.555 / 0.592 | 0.331 / 0.319 |
+| **fusion-embedding-1-2b-preview v0.2** | 0.418 / 0.440 | **0.588 / 0.631** | **0.331 / 0.319** |
 
-Full audio→image metrics (per-modality mean-centered readout): R@1 0.085, R@5 0.260,
-R@10 0.368 (26× chance), mAP@10 0.155 — with zero audio–image training pairs. What that
-looks like (query clip's frame left; green = the clip's exact frame among the top 5):
+Full v0.2 audio→image metrics (per-modality mean-centered readout): R@1 0.088, R@5 0.315,
+R@10 0.418 (29× chance), mAP@10 0.179 — with zero audio–image training pairs. What that
+looks like (v0.1 examples; query clip's frame left; green = the clip's exact frame among
+the top 5):
 
 ![Audio-to-image retrieval examples](assets/audio_to_image_gallery.png)
 

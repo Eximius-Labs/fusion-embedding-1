@@ -15,7 +15,7 @@ import sys
 
 import torch
 
-SHARD = "audiocaps10k_sharded,fsd50k_train,wavcaps_audioset_sl_full"
+DEFAULT_SHARD = "audiocaps10k_sharded,fsd50k_train,wavcaps_audioset_sl_full"
 OUT = os.path.join(os.path.dirname(__file__), "out")
 CKPT_OUT = "fusion-embedding-1-2b-preview.pt"
 PROTOCOL = {
@@ -40,7 +40,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-tag", default="_a0native_384_800")
     ap.add_argument("--steps", type=int, default=800)
+    ap.add_argument("--shard", default=DEFAULT_SHARD)
+    ap.add_argument("--version", default="0.1-preview")
     args = ap.parse_args()
+    global SHARD
+    SHARD = args.shard
     os.makedirs(OUT, exist_ok=True)
 
     ckpt_name = f"p1frames_{SHARD}_step{args.steps}{args.run_tag}.pt"
@@ -78,7 +82,7 @@ def main() -> None:
         "source_run": {"ckpt": ckpt_name, "steps": args.steps, "run_tag": args.run_tag},
         "base_model": "Qwen/Qwen3-VL-Embedding-2B",
         "audio_model": "Qwen/Qwen2.5-Omni-7B",
-        "version": "0.1-preview",
+        "version": args.version,
     }
     out_path = os.path.join(OUT, CKPT_OUT)
     torch.save(packaged, out_path)
