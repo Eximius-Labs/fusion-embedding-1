@@ -88,8 +88,8 @@ Full audio→image metrics (per-modality mean-centered gallery — the readout i
 | v0.1 | 0.085 | 0.260 | 0.368 | 0.155 |
 | **v0.2** | **0.088** | **0.315** | **0.418** | **0.179** |
 
-**What audio→image retrieval looks like.** The 0.368 above is not only an aggregate — the
-retrievals are organized by sound. Real examples (v0.1 checkpoint) on VGGSound-696
+**What audio→image retrieval looks like.** The 0.418 above is not only an aggregate — the
+retrievals are organized by sound. Real examples (v0.2 checkpoint) on VGGSound-696
 (query clip's frame left, top-5 retrieved images right; green = the clip's exact frame):
 
 ![Audio-to-image retrieval examples](assets/audio_to_image_gallery.png)
@@ -100,21 +100,22 @@ retrievals are organized by sound. Real examples (v0.1 checkpoint) on VGGSound-6
 
 | Sound | Top-5 retrieval | Exact frame |
 |---|---|---|
-| A siren | its own ambulance, then more emergency vehicles | rank 2 |
-| *"Switch on the good piece"* (speech) | the appliance being switched on | rank 1 |
-| A whirring kitchen motor | its own blender, among mixers | rank 3 |
-| An emergency-vehicle siren | fire engines and ambulances | rank 4 |
-| Metallic clanking and banging | the kitchen it came from | rank 5 |
+| Metallic clanking and banging | the kitchen it came from, first | rank 1 |
+| A dog howling | its own dog, then more howling dogs | rank 1 |
+| A cat purring | its own cat, then more purring and meowing cats | rank 1 |
+| A siren with a dog howling | its own scene among howling dogs | rank 2 |
+| *"Switch on the good piece"* (speech) | the blender being switched on | rank 2 |
+| A female singer in a reverberant space | stage performances and singers | rank 3 |
 
-*Right neighbourhood* — the exact frame ranks lower (often a poor still), but every top
-result is the correct sound category:
+*Right neighbourhood* — the exact frame ranks lower (often a poor still), but the top
+results are the correct sound category:
 
 | Sound | Top-5 retrieval | Exact frame |
 |---|---|---|
-| A distinct click | people typing at keyboards | rank 109 |
-| A power motor | an angle grinder, a belt sander, a table saw | rank 68 |
-| A single cowbell note | cattle herds, one wearing a bell | rank 6 |
-| High squeaks and chirps | chickens, crows, a quail, a parrot | rank 104 |
+| A man speaking Spanish amid birdsong | a man speaking with birds chirping behind | rank 13 |
+| A cat's rhythmic purring | purring and meowing cats | rank 15 |
+| Bird chirps and tweets | songbirds, owls, a cawing crow | rank 18 |
+| A power-tool whirring | drills and small motors | rank 32 |
 
 Text, image, and video benchmarks are the base model's published MMEB-V2 results, which
 are unaffected by this extension.

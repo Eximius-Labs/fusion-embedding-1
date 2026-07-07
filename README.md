@@ -276,7 +276,7 @@ on audio–text only — its audio↔image alignment is emergent):
 
 Full v0.2 audio→image metrics (per-modality mean-centered readout): R@1 0.088, R@5 0.315,
 R@10 0.418 (29× chance), mAP@10 0.179 — with zero audio–image training pairs. What that
-looks like (v0.1 examples; query clip's frame left; green = the clip's exact frame among
+looks like (v0.2 examples; query clip's frame left; green = the clip's exact frame among
 the top 5):
 
 ![Audio-to-image retrieval examples](assets/audio_to_image_gallery.png)
