@@ -17,3 +17,7 @@ results/
 
 # Claude Code local session/config — not tracked
 .claude/
+
+# Release build artifacts + internal runbook — the shipped files live on the HF repo
+release/out/
+release/UPLOAD.md

@@ -235,19 +235,22 @@ def write_frame_shard(path, records: Sequence[dict], half: bool = True) -> None:
                 "task": [r.get("task", "sound") for r in records]}, str(path))
 
 
-def text_emb_shard_path(frame_shard_path) -> str:
+def text_emb_shard_path(frame_shard_path, tag: str = "") -> str:
     """Sibling path holding a frame shard's precomputed RAW text embeddings (Step 2 cache).
 
     Kept SEPARATE from the frame shard on disk (``shard-0000.pt`` → ``shard-0000.txtemb.pt``) but
     joined by clip position, so the text cache can be (re)built independently of the frames.
+    ``tag`` names an ALTERNATE cache variant (e.g. ``_native`` for chat-template targets) so
+    variants coexist: ``shard-0000.txtemb_native.pt``.
     """
     p = str(frame_shard_path)
-    return p[:-3] + ".txtemb.pt" if p.endswith(".pt") else p + ".txtemb.pt"
+    suffix = f".txtemb{tag}.pt"
+    return p[:-3] + suffix if p.endswith(".pt") else p + suffix
 
 
-def write_text_emb_shard(frame_shard_path, embs: torch.Tensor) -> None:
+def write_text_emb_shard(frame_shard_path, embs: torch.Tensor, tag: str = "") -> None:
     """Write ``[n_clips, d_llm]`` fp16 RAW (pre-whitening) text embeddings beside a frame shard."""
-    torch.save({"text_emb": embs.half().contiguous()}, text_emb_shard_path(frame_shard_path))
+    torch.save({"text_emb": embs.half().contiguous()}, text_emb_shard_path(frame_shard_path, tag))
 
 
 def _shard_record(shard: dict, off: int, text_embs: Optional[torch.Tensor] = None) -> dict:
@@ -267,7 +270,8 @@ def shard_starts_from(n_shards: int, shard_size: int, n_total: int) -> list[int]
 
 
 def load_frame_clips(shard_paths: Sequence, shard_starts: Sequence[int],
-                     global_indices: Iterable[int], *, with_text_emb: bool = False) -> list[dict]:
+                     global_indices: Iterable[int], *, with_text_emb: bool = False,
+                     text_emb_tag: str = "") -> list[dict]:
     """Materialise specific clips (by global index) into a list — for the small held-out eval set.
 
     ``shard_starts[p]`` is the global index of clip 0 in shard ``p`` (robust to partial shards when
@@ -287,7 +291,7 @@ def load_frame_clips(shard_paths: Sequence, shard_starts: Sequence[int],
         shard = torch.load(str(shard_paths[pos]), map_location="cpu", weights_only=False)
         tembs = None
         if with_text_emb:
-            tp = text_emb_shard_path(shard_paths[pos])
+            tp = text_emb_shard_path(shard_paths[pos], text_emb_tag)
             if not os.path.exists(tp):
                 raise FileNotFoundError(f"text cache missing: {tp} — run precompute_text_cache first")
             tembs = torch.load(tp, map_location="cpu", weights_only=False)["text_emb"]
@@ -309,7 +313,8 @@ class ShardedFrameDataset(IterableDataset):
 
     def __init__(self, shard_paths: Sequence, shard_starts: Sequence[int], *,
                  exclude: Optional[set] = None, shuffle_buffer: int = 2048,
-                 shuffle_shards: bool = True, seed: int = 0, use_text_emb: bool = False):
+                 shuffle_shards: bool = True, seed: int = 0, use_text_emb: bool = False,
+                 text_emb_tag: str = "", max_frames: int = 0):
         self.shard_paths = [str(p) for p in shard_paths]
         self.shard_starts = list(shard_starts)
         self.exclude = set(exclude or ())
@@ -317,6 +322,11 @@ class ShardedFrameDataset(IterableDataset):
         self.shuffle_shards = shuffle_shards
         self.seed = seed
         self.use_text_emb = use_text_emb                          # attach cached RAW text (Step 2)
+        self.text_emb_tag = text_emb_tag
+        # Random-crop long clips to max_frames (~25 frames/s; 250 = 10 s, the CLAP-standard
+        # training window). 0 = no crop. Cuts I/O and worker RAM ~2.5x on long-clip corpora
+        # (FreeSound averages ~25 s) and doubles as light temporal augmentation.
+        self.max_frames = int(max_frames)
         self._epoch = 0
 
     def __iter__(self):
@@ -335,7 +345,7 @@ class ShardedFrameDataset(IterableDataset):
             tembs = None
             if self.use_text_emb:
                 import os
-                tp = text_emb_shard_path(self.shard_paths[pos])
+                tp = text_emb_shard_path(self.shard_paths[pos], self.text_emb_tag)
                 if not os.path.exists(tp):
                     raise FileNotFoundError(f"text cache missing: {tp} — run precompute_text_cache first")
                 tembs = torch.load(tp, map_location="cpu", weights_only=False)["text_emb"]
@@ -344,6 +354,9 @@ class ShardedFrameDataset(IterableDataset):
                 if (start + off) in self.exclude:
                     continue
                 rec = _shard_record(shard, off, tembs)
+                if self.max_frames and rec["frames"].shape[0] > self.max_frames:
+                    t0 = buf_rng.randrange(rec["frames"].shape[0] - self.max_frames + 1)
+                    rec["frames"] = rec["frames"][t0: t0 + self.max_frames].contiguous()
                 if len(buffer) < self.shuffle_buffer:
                     buffer.append(rec)
                 else:

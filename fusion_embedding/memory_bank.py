@@ -123,7 +123,8 @@ class CorpusTextBank:
 
 @torch.no_grad()
 def build_corpus_bank_from_cache(shard_paths, captions, whitening, *, exclude=None,
-                                 device: str | torch.device = "cpu") -> CorpusTextBank:
+                                 device: str | torch.device = "cpu",
+                                 text_emb_tag: str = "") -> CorpusTextBank:
     """Assemble a ``CorpusTextBank`` from sibling ``.txtemb.pt`` caches (Step 2).
 
     ``shard_paths``/``captions`` are the trainer's concatenated frame-shard order (bank row i
@@ -133,7 +134,7 @@ def build_corpus_bank_from_cache(shard_paths, captions, whitening, *, exclude=No
     """
     from .data import text_emb_shard_path
 
-    chunks = [torch.load(text_emb_shard_path(p), map_location="cpu", weights_only=False)["text_emb"]
+    chunks = [torch.load(text_emb_shard_path(p, text_emb_tag), map_location="cpu", weights_only=False)["text_emb"]
               for p in shard_paths]
     raw = torch.cat(chunks)                                     # [N_total, d_llm] fp16 RAW
     if raw.size(0) != len(captions):

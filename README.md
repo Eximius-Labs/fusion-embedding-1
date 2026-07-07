@@ -4,8 +4,8 @@
 
 **One model. One vector space. Text, image, video, audio — and PDF.**
 
-*An open-weight multimodal embedding model that grafts audio onto the strongest
-open vision-language embedding base — without touching a single base weight.*
+*An open-weight multimodal embedding model that extends a state-of-the-art
+vision-language embedding base with audio — without modifying a single base weight.*
 
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](#)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](#)
@@ -25,9 +25,9 @@ clustering, and cross-modal search — and designed to be **fully self-hostable*
 Instead of training a multimodal embedder from scratch, Fusion takes
 [Qwen3-VL-Embedding](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B) — an
 open state-of-the-art text/image/video embedding model — **freezes it
-byte-for-byte**, and grafts an audio pathway onto it: a frozen
+byte-for-byte**, and adds an audio pathway to it: a frozen
 [Qwen2.5-Omni](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) audio tower feeds a
-small trained connector (the **FusionResampler**, ~7M parameters, ≈0.36% of the
+small trained connector (the **FusionResampler**, ~16M parameters, <1% of the
 base) that translates audio into the base's input space. Audio is aligned to
 text contrastively; because text, image, and video already share the base's
 space, **audio↔image and audio↔video alignment emerge through the text bridge**
@@ -39,23 +39,23 @@ you inherit the base's retrieval quality exactly, and add audio on top.
 
 ## Highlights
 
-- **Five modalities, one space** — text, image, video, audio, and PDF embed
-  into the same vector space; any-to-any retrieval works out of the box.
-- **Frozen-base grafting** — only a ~7M-parameter connector and a temperature
-  are trained. The base is never fine-tuned, so its MMEB-V2 performance is
-  inherited *by construction*, not re-benchmarked and hoped for.
+- **Five modalities, one space** — text, image, video, audio, and PDF in a
+  single vector space, designed for retrieval in any direction between modalities.
+- **Frozen-base architecture** — only a ~16M-parameter connector and a temperature
+  are trained. The base is never fine-tuned; its MMEB-V2 performance is
+  inherited unchanged, by construction.
 - **Matryoshka embeddings** — truncate to any rung of
   `{2048, 1536, 1024, 512, 256, 128, 64}` and re-normalize; embeddings stay
   consistent at every dimension (default 1024).
 - **Instruction-aware audio** — the same clip embeds differently for
   different tasks (*sound description* vs *spoken content* vs *speaker/emotion*),
   matching the base's instruction conditioning.
-- **Full speech ambition** — the audio tower is Whisper-large-v3-derived;
-  speech content, language, and paralinguistics are first-class targets, not an
-  afterthought.
+- **Speech as a first-class target** — the audio tower is Whisper-large-v3-derived;
+  speech content, language, and paralinguistics are on the roadmap alongside
+  sound events and music.
 - **Self-hostable** — no API, no rate limits; runs quantized on a single
-  consumer GPU for inference, and the connector-only design makes training
-  radically cheap.
+  consumer GPU for inference, and the connector-only design keeps training
+  costs low.
 - **Test-first engineering** — the entire pipeline runs end-to-end on tiny
   CPU stand-ins (no GPU, no `transformers`) via dependency injection at the
   model seams; 125+ unit and E2E tests.
@@ -71,16 +71,16 @@ audio ─▶ [Qwen2.5-Omni    │                                               
          (FROZEN)         │                                                                    │
          frames [B,T,3584]│                                                                    │
    └─▶ [FusionResampler] ─┼─▶ audio tokens [B,N,2048] ─▶ spliced at <|audio_pad|> positions ──▶│
-        (TRAINED, ~7M)    │      ─▶ frozen LLM ─▶ EOS-token hidden state [B, 2048]             │
+        (TRAINED, ~16M)   │      ─▶ frozen LLM ─▶ EOS-token hidden state [B, 2048]             │
                           └───────────────────────────────────────────────────┬───────────────┘
                                                                               ▼
                                        MRL-truncate (any ladder rung) ─▶ L2-normalize ─▶ embedding
 ```
 
 The **FusionResampler** is a Flamingo-style perceiver resampler running at a
-256-d bottleneck: `in_proj 3584→256` → N=64 learnable latent queries through
+384-d bottleneck: `in_proj 3584→384` → N=64 learnable latent queries through
 L=6 pre-norm blocks (self-attention → cross-attention over audio frames → FFN)
-→ `out_proj 256→2048`. Its N output tokens overwrite `<|audio_pad|>` placeholder
+→ `out_proj 384→2048`. Its N output tokens overwrite `<|audio_pad|>` placeholder
 positions in the frozen LLM's input-embedding stream — the exact mirror of the
 base's image-token mechanism. EOS pooling and the MRL ladder are the base's own;
 **audio conforms to the base, never the reverse.**
@@ -94,18 +94,21 @@ frozen-text architectures.
 
 | Model | Base | Params (trained / total) | Embedding dim | MRL ladder | Status |
 |---|---|---|---|---|---|
-| `fusion-embedding-1-2B` | Qwen3-VL-Embedding-2B | ~7M / 2B | 2048 | 2048 → 64 | in training (P1) |
+| [`fusion-embedding-1-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview) | Qwen3-VL-Embedding-2B | ~16M / 2B | 2048 | 2048 → 64 | **preview released** |
 | `fusion-embedding-1-8B` | Qwen3-VL-Embedding-8B | scaled / 8B | ~4096 | ~4096 → 64 | planned |
 
-> **Research preview.** Weights are not yet released — the audio pathway is in
-> active Stage-1 (audio↔text alignment) training. Benchmarks will be published
-> with the first checkpoint release, evaluated on the standard protocols
-> (AudioCaps / Clotho multi-reference retrieval, MAEB, MMEB-V2 regression).
+> **Research preview available:**
+> [EximiusLabs/fusion-embedding-1-2b-preview](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
+> — connector weights, model card with benchmarks (AudioCaps / Clotho zero-shot /
+> VGGSound cross-modal incl. an ImageBind comparison), and a packaged inference API.
+> Training continues; updated checkpoints will be released under the same family.
 
 ## Usage
 
-The inference API mirrors the training code in this repository. Once weights
-are released, embedding audio and text looks like this:
+For the packaged high-level API, see `inference.py` on the
+[HF model repo](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
+(`FusionEmbedder.embed_audio / embed_text / embed_image`). The low-level path
+using this repository's components:
 
 ```python
 import torch
@@ -113,13 +116,15 @@ from fusion_embedding.config import FusionConfig
 from fusion_embedding.model import FusionEmbeddingModel
 from fusion_embedding.hf_components import load_components
 
-# Load the frozen Qwen base + Omni audio tower + the trained connector
+# Load the frozen Qwen base + Omni audio tower + the trained connector.
+# NOTE: base precision must match the checkpoint's training precision (recorded in the
+# checkpoint as `base_4bit`); released checkpoints are bf16-trained.
 cfg = FusionConfig()
 cfg, embed_tokens, base_lm, audio_encoder, tokenizer, feature_extractor = load_components(
-    cfg, device="cuda", load_in_4bit=True,     # 4-bit base: inference fits consumer GPUs
+    cfg, device="cuda", load_in_4bit=False,
 )
 model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder)
-ckpt = torch.load("fusion-embedding-1-2b-p1.pt")
+ckpt = torch.load("fusion-embedding-1-2b-preview.pt")
 model.resampler.load_state_dict(ckpt["resampler"])
 model.text_whitening.load_state_dict(ckpt["text_whitening"])
 
@@ -129,15 +134,20 @@ audio_tok = model.audio_tokens(mel.cuda())                 # frozen tower -> res
 pooled = model.encode_audio(audio_ids, audio_mask, audio_tok)
 audio_emb = model.embed(pooled, dim=1024)                  # MRL-truncate + L2-normalize
 
-# --- embed a query (instruction-conditioned) ---------------------------------
-query = "Retrieve audio by sound description. A dog barks while rain falls."
-ids = tokenizer(query, return_tensors="pt")
+# --- embed a query (the base model's chat-template format is REQUIRED) --------
+query = ("<|im_start|>system\nRetrieve audio by sound description.<|im_end|>\n"
+         "<|im_start|>user\nA dog barks while rain falls.<|im_end|>\n"
+         "<|im_start|>assistant\n")
+ids = tokenizer(query, return_tensors="pt", add_special_tokens=False)
 pooled_t = model.text_whitening(model.encode_text(ids["input_ids"].cuda(),
                                                   ids["attention_mask"].cuda()))
 text_emb = model.embed(pooled_t, dim=1024)
 
 score = (audio_emb @ text_emb.T)                           # cosine similarity
 ```
+
+For a packaged, higher-level API (`FusionEmbedder.embed_audio / embed_text / embed_image`),
+see `release/inference.py` — it applies the correct templates and pooling automatically.
 
 **Matryoshka truncation** — pick your speed/quality point at query time, no
 re-encoding:
@@ -276,10 +286,10 @@ Matryoshka Representation Learning, and the audio-caption data ecosystem
 
 ```bibtex
 @software{fusion_embedding_2026,
-  title  = {Fusion Embedding: Grafting Audio onto Frozen Vision-Language
-            Embedding Models},
+  title  = {Fusion Embedding 1: A Unified Embedding Space for Text,
+            Image, Video, and Audio},
   author = {Tonmoy, Abdul Basit},
   year   = {2026},
-  url    = {https://github.com/eximius-labs/fusion-embeddings}
+  url    = {https://github.com/Eximius-Labs/fusion-embedding-1}
 }
 ```

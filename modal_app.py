@@ -50,6 +50,9 @@ image = (
         "soundfile>=0.12",
         "librosa>=0.10",
         "datasets>=3.0",                               # real audio-caption datasets
+        "pillow>=10.0",                                # Phase 0: image path through the frozen base
+        "torchvision==0.21.0",                         # Phase 0: Qwen3-VL processor requirement
+        "av>=12.0",                                    # Phase 0: video-frame extraction for AV pairs
         extra_index_url="https://download.pytorch.org/whl/cu124",
     )
     # Ship the local package into the image so `import fusion_embedding` works in the container.
@@ -65,7 +68,10 @@ app = modal.App(APP_NAME, image=image)
 # FUSION_DATA_ROOT makes fusion_embedding.paths resolve features/frames/checkpoints to the
 # Volume here — and to a local dir / mounted bucket off Modal. One env var = provider-portable.
 HF_ENV = {"HF_HOME": HF_CACHE, "HF_XET_HIGH_PERFORMANCE": "1", "FUSION_DATA_ROOT": VOL,
-          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+          # A dead connection must FAIL (and be retried), not hang forever — a FreeSound
+          # ingest sat 34 min on one tar download with no exception (2026-07-06).
+          "HF_HUB_DOWNLOAD_TIMEOUT": "60"}
 
 BASE_MODEL = "Qwen/Qwen3-VL-Embedding-2B"
 AUDIO_MODEL = "Qwen/Qwen2.5-Omni-7B"
@@ -990,11 +996,15 @@ def _wavcaps_excluded(iid: str, excl: set) -> bool:
 
 
 @app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=24 * 3600,
-              memory=32768, cpu=4.0, env=HF_ENV)
+              memory=32768, cpu=4.0, env=HF_ENV,
+              # Preemption resilience for LONG ingests (FreeSound ~13h): auto-retry + the
+              # per-shard progress file below -> a crash resumes at the last completed shard.
+              retries=modal.Retries(max_retries=3, initial_delay=10.0, backoff_coefficient=1.0))
 def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str = "test",
                           frame_shard: str = "wavcaps_audioset_sl", audio_feature_layer: str = "post_proj",
                           shard_size: int = 512, limit: int = 0, apply_blacklist: bool = True,
-                          batch: int = 16, id_col: str = "id", caption_col: str = "caption") -> dict:
+                          batch: int = 16, id_col: str = "id", caption_col: str = "caption",
+                          exclusion: str = "wavcaps", finalize: bool = True) -> dict:
     """FUSED ingestion: stream a WavCaps mirror -> decode -> Whisper mel -> frozen audio tower ->
     SHARDED frames directly. No 108K intermediate mel files, no zip reassembly, one GPU pass.
     Applies the eval-leakage blacklist by id (AudioSet_SL heavily overlaps AudioCaps).
@@ -1025,7 +1035,7 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
                                          audio_feature_layer=audio_feature_layer)
 
     excl: set = set()
-    if apply_blacklist:
+    if apply_blacklist and exclusion == "wavcaps":
         for bl in ("blacklist_exclude_all_ac.json", "blacklist_exclude_ub8k_esc50_vggsound.json"):
             try:
                 p = hf_hub_download("cvssp/WavCaps", f"json_files/blacklist/{bl}",
@@ -1035,13 +1045,46 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
             except Exception as e:                               # noqa: BLE001
                 print(f"  blacklist {bl}: {e}")
         print(f"blacklist excludes {len(excl)} ids")
-
-    ds = load_dataset(repo, split=split, streaming=True, token=token).cast_column("audio", Audio(decode=False))
-    if limit:
-        ds = itertools.islice(ds, limit)
+    elif apply_blacklist and exclusion == "audiocaps_evals":
+        # For ingesting AudioCaps TRAIN itself: exclude only the official test+val clips
+        # (the WavCaps ac-blacklist would exclude the whole dataset). Ids from the official
+        # AudioCaps repo CSVs, by youtube_id.
+        import csv as _csv
+        import urllib.request
+        for split_csv in ("test.csv", "val.csv"):
+            url = f"https://raw.githubusercontent.com/cdjkim/audiocaps/master/dataset/{split_csv}"
+            with urllib.request.urlopen(url) as resp:
+                rows = list(_csv.DictReader(io.TextIOWrapper(resp, encoding="utf-8")))
+            excl |= {r["youtube_id"] for r in rows}
+        print(f"audiocaps_evals exclusion: {len(excl)} test+val youtube_ids")
 
     out_dir = frames_dir(frame_shard)
     os.makedirs(str(out_dir), exist_ok=True)
+
+    # Resume state: written atomically after every completed shard. On restart (crash,
+    # preemption->auto-retry, or manual rerun) we skip the already-processed stream prefix
+    # (deterministic streaming order) and continue appending shards.
+    progress_path = out_dir / "_ingest_progress.json"
+    prog = {"n_seen": 0, "n_kept": 0, "n_bl": 0, "n_bad": 0,
+            "shards": [], "captions": [], "tasks": []}
+    if os.path.exists(str(progress_path)):
+        with open(str(progress_path)) as fh:
+            prog = json.load(fh)
+        print(f"RESUME: {prog['n_seen']} rows already processed "
+              f"({prog['n_kept']} kept, {len(prog['shards'])} shards) — skipping stream prefix")
+
+    def _save_progress():
+        tmp = str(progress_path) + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(prog, fh)
+        os.replace(tmp, str(progress_path))
+
+    ds = load_dataset(repo, split=split, streaming=True, token=token).cast_column("audio", Audio(decode=False))
+    if prog["n_seen"]:
+        ds = ds.skip(prog["n_seen"])
+    if limit:
+        remaining = max(0, limit - prog["n_seen"])
+        ds = itertools.islice(ds, remaining)
 
     def _decode(a):
         if a.get("bytes"):
@@ -1057,10 +1100,7 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
     mel_buf: list = []
     cap_buf: list = []
     shard_recs: list = []
-    captions: list = []
-    tasks: list = []
-    shard_files: list = []
-    n_seen = n_kept = n_bl = n_bad = 0
+    pending_seen = 0                                             # rows consumed but not yet checkpointed
 
     def _run_tower():                                            # mel batch -> frames -> shard buffer
         if not mel_buf:
@@ -1074,21 +1114,31 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
         for i, cap in enumerate(cap_buf):
             t = int(fmask[i].sum().item())
             shard_recs.append({"frames": frames[i, :t].cpu().contiguous(), "text": cap, "task": "sound"})
-            captions.append(cap); tasks.append("sound")
         mel_buf.clear(); cap_buf.clear()
 
     def _write_shard():
+        # A shard write is the CHECKPOINT unit: shard file + progress (incl. the rows consumed
+        # to produce it) commit together, so a crash resumes exactly at the last shard boundary.
+        nonlocal pending_seen
         if not shard_recs:
             return
-        name = f"shard-{len(shard_files):04d}.pt"
+        name = f"shard-{len(prog['shards']):04d}.pt"
         write_frame_shard(out_dir / name, shard_recs, half=True)
-        shard_files.append(name); shard_recs.clear(); volume.commit()
+        prog["shards"].append(name)
+        prog["captions"] += [r["text"] for r in shard_recs]
+        prog["tasks"] += [r["task"] for r in shard_recs]
+        prog["n_kept"] += len(shard_recs)
+        prog["n_seen"] += pending_seen
+        pending_seen = 0
+        shard_recs.clear()
+        _save_progress()
+        volume.commit()
 
     for row in ds:
-        n_seen += 1
+        pending_seen += 1
         iid = os.path.basename(str(row.get(id_col, "")))         # "./train/10047" -> "10047"
         if apply_blacklist and _wavcaps_excluded(iid, excl):
-            n_bl += 1
+            prog["n_bl"] += 1
             continue
         cap = str(row.get(caption_col, "")).strip()
         if not cap:
@@ -1096,7 +1146,7 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
         try:
             wav = _decode(row["audio"])
         except Exception:                                        # noqa: BLE001
-            n_bad += 1
+            prog["n_bad"] += 1
             continue
         feats = fe(wav, sampling_rate=sr, return_tensors="pt", return_attention_mask=True,
                    padding="max_length", truncation=True)
@@ -1104,23 +1154,275 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
         am = feats.get("attention_mask")
         if am is not None:
             mel = mel[:, : int(am[0].sum().item())]
-        mel_buf.append(mel); cap_buf.append(cap); n_kept += 1
+        mel_buf.append(mel); cap_buf.append(cap)
         if len(mel_buf) >= batch:
             _run_tower()
         if len(shard_recs) >= shard_size:
             _write_shard()
-        if n_kept % 500 == 0:
-            print(f"  seen={n_seen} kept={n_kept} bl={n_bl} bad={n_bad} shards={len(shard_files)}", flush=True)
+        if (prog["n_kept"] + len(shard_recs)) % 500 < 1:
+            print(f"  seen={prog['n_seen'] + pending_seen} kept~{prog['n_kept'] + len(shard_recs)} "
+                  f"bl={prog['n_bl']} bad={prog['n_bad']} shards={len(prog['shards'])}", flush=True)
     _run_tower(); _write_shard()
 
-    with open(str(out_dir / "index.json"), "w") as fh:
-        json.dump({"d_audio": d_audio, "shard_size": shard_size, "n_total": n_kept,
-                   "captions": captions, "tasks": tasks, "shards": shard_files}, fh)
-    volume.commit()
-    result = {"frame_shard": frame_shard, "repo": repo, "seen": n_seen, "kept": n_kept,
-              "blacklisted": n_bl, "decode_fail": n_bad, "shards": len(shard_files), "d_audio": d_audio}
+    if finalize:
+        with open(str(out_dir / "index.json"), "w") as fh:
+            json.dump({"d_audio": d_audio, "shard_size": shard_size, "n_total": prog["n_kept"],
+                       "captions": prog["captions"], "tasks": prog["tasks"],
+                       "shards": prog["shards"]}, fh)
+        if os.path.exists(str(progress_path)):
+            os.remove(str(progress_path))                        # clean finish -> no stale resume state
+        volume.commit()
+    result = {"frame_shard": frame_shard, "repo": repo, "seen": prog["n_seen"], "kept": prog["n_kept"],
+              "blacklisted": prog["n_bl"], "decode_fail": prog["n_bad"],
+              "shards": len(prog["shards"]), "d_audio": d_audio, "finalized": finalize}
     print(f"INGEST_WAVCAPS_FRAMES: {result}")
     return result
+
+
+@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=24 * 3600,
+              memory=32768, cpu=4.0, env=HF_ENV,
+              retries=modal.Retries(max_retries=3, initial_delay=10.0, backoff_coefficient=1.0))
+def ingest_webdataset_frames(repo: str = "Meranti/CLAP_freesound",
+                             prefixes: str = "freesound/train_1,freesound/train_2",
+                             frame_shard: str = "laion_freesound_full",
+                             audio_feature_layer: str = "post_proj", shard_size: int = 512,
+                             limit_tars: int = 0, batch: int = 16,
+                             apply_blacklist: bool = True, finalize: bool = True) -> dict:
+    """FUSED ingestion for WebDataset tar mirrors (LAION-Freesound): stream each tar ->
+    pair {id}.flac/{id}.json -> caption from json['text'] -> blacklist (WavCaps lists carry
+    the Freesound ids of Clotho/ESC-50/UrbanSound8K) -> mel -> frozen tower -> sharded frames.
+
+    RESUME at TAR granularity: `_ingest_progress.json` records completed tars; a crash or
+    preemption (auto-retry x3) re-downloads nothing already processed. Caption strategy:
+    prefer the description (text[1]) when it has >=5 words, else the title; drop <3-word
+    captions (WavCaps filter)."""
+    import io
+    import json
+    import os
+    import tarfile
+
+    import librosa
+    import soundfile as sf
+    import torch
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoFeatureExtractor
+
+    from fusion_embedding.data import write_frame_shard
+    from fusion_embedding.hf_components import load_audio_tower
+    from fusion_embedding.paths import frames_dir
+
+    dev = "cuda"
+    token = os.environ.get("HF_TOKEN") or None
+    fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True, token=token)
+    sr = fe.sampling_rate
+    enc, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16,
+                                         audio_feature_layer=audio_feature_layer)
+
+    excl: set = set()
+    if apply_blacklist:
+        for bl in ("blacklist_exclude_all_ac.json", "blacklist_exclude_ub8k_esc50_vggsound.json"):
+            try:
+                p = hf_hub_download("cvssp/WavCaps", f"json_files/blacklist/{bl}",
+                                    repo_type="dataset", token=token)
+                with open(p) as fh:
+                    _flatten_ids(json.load(fh), excl)
+            except Exception as e:                               # noqa: BLE001
+                print(f"  blacklist {bl}: {e}")
+        print(f"blacklist excludes {len(excl)} ids")
+
+    pfx = [p.strip() for p in prefixes.split(",") if p.strip()]
+    files = HfApi().list_repo_files(repo, repo_type="dataset", token=token)
+    tars = sorted([f for f in files if f.endswith(".tar") and any(f.startswith(p + "/") for p in pfx)],
+                  key=lambda f: (f.rsplit("/", 1)[0], int(f.rsplit("/", 1)[1][:-4])))
+    if limit_tars:
+        tars = tars[:limit_tars]
+    print(f"{len(tars)} tars to process under {pfx}")
+
+    out_dir = frames_dir(frame_shard)
+    os.makedirs(str(out_dir), exist_ok=True)
+    progress_path = out_dir / "_ingest_progress.json"
+    prog = {"completed_tars": [], "n_kept": 0, "n_bl": 0, "n_bad": 0,
+            "shards": [], "captions": [], "tasks": []}
+    if os.path.exists(str(progress_path)):
+        with open(str(progress_path)) as fh:
+            prog = json.load(fh)
+        print(f"RESUME: {len(prog['completed_tars'])} tars done "
+              f"({prog['n_kept']} kept, {len(prog['shards'])} shards)")
+
+    def _save_progress():
+        tmp = str(progress_path) + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(prog, fh)
+        os.replace(tmp, str(progress_path))
+
+    mel_buf: list = []
+    cap_buf: list = []
+    shard_recs: list = []
+
+    def _run_tower():
+        if not mel_buf:
+            return
+        n_mels = mel_buf[0].shape[0]; Fmax = max(m.shape[1] for m in mel_buf)
+        mb = torch.zeros(len(mel_buf), n_mels, Fmax, device=dev)
+        mm = torch.zeros(len(mel_buf), Fmax, dtype=torch.bool, device=dev)
+        for i, m in enumerate(mel_buf):
+            mb[i, :, : m.shape[1]] = m.to(dev); mm[i, : m.shape[1]] = True
+        frames, fmask = enc(mb, mm)
+        for i, cap in enumerate(cap_buf):
+            t = int(fmask[i].sum().item())
+            shard_recs.append({"frames": frames[i, :t].cpu().contiguous(), "text": cap, "task": "sound"})
+        mel_buf.clear(); cap_buf.clear()
+
+    def _write_shard(force=False):
+        if not shard_recs or (not force and len(shard_recs) < shard_size):
+            return
+        name = f"shard-{len(prog['shards']):04d}.pt"
+        write_frame_shard(out_dir / name, shard_recs, half=True)
+        prog["shards"].append(name)
+        prog["captions"] += [r["text"] for r in shard_recs]
+        prog["tasks"] += [r["task"] for r in shard_recs]
+        prog["n_kept"] += len(shard_recs)
+        shard_recs.clear()
+        _save_progress()
+        volume.commit()
+
+    def _caption(j) -> str:
+        texts = [str(t).strip() for t in (j.get("text") or []) if str(t).strip()]
+        cap = ""
+        if len(texts) >= 2 and len(texts[1].split()) >= 5:
+            cap = texts[1]
+        elif texts:
+            cap = texts[0]
+        return cap if len(cap.split()) >= 3 else ""
+
+    for tar_name in tars:
+        if tar_name in prog["completed_tars"]:
+            continue
+        local = None
+        for attempt in range(3):                                 # transient net errors: retry in place
+            try:
+                local = hf_hub_download(repo, tar_name, repo_type="dataset", token=token)
+                break
+            except Exception as e:                               # noqa: BLE001
+                print(f"  download attempt {attempt + 1}/3 failed for {tar_name}: {e}")
+        if local is None:
+            print(f"  DOWNLOAD FAIL {tar_name} after 3 attempts — skipping"); prog["n_bad"] += 1
+            prog["completed_tars"].append(tar_name); _save_progress()
+            continue
+        flac_bytes: dict = {}
+        meta: dict = {}
+        with tarfile.open(local, mode="r") as tf:
+            for m in tf:
+                if not m.isfile():
+                    continue
+                stem = os.path.basename(m.name).rsplit(".", 1)[0]
+                if m.name.endswith(".flac"):
+                    flac_bytes[stem] = tf.extractfile(m).read()
+                elif m.name.endswith(".json"):
+                    try:
+                        meta[stem] = json.loads(tf.extractfile(m).read())
+                    except Exception:                            # noqa: BLE001
+                        pass
+                if stem in flac_bytes and stem in meta:          # complete pair -> process now
+                    if apply_blacklist and _wavcaps_excluded(stem, excl):
+                        prog["n_bl"] += 1
+                    else:
+                        cap = _caption(meta[stem])
+                        if cap:
+                            try:
+                                wav, sr0 = sf.read(io.BytesIO(flac_bytes[stem]), dtype="float32")
+                                if wav.ndim > 1:
+                                    wav = wav.mean(axis=1)
+                                if sr0 != sr:
+                                    wav = librosa.resample(wav, orig_sr=sr0, target_sr=sr)
+                                feats = fe(wav, sampling_rate=sr, return_tensors="pt",
+                                           return_attention_mask=True, padding="max_length",
+                                           truncation=True)
+                                mel = feats["input_features"][0]
+                                am = feats.get("attention_mask")
+                                if am is not None:
+                                    mel = mel[:, : int(am[0].sum().item())]
+                                mel_buf.append(mel); cap_buf.append(cap)
+                                if len(mel_buf) >= batch:
+                                    _run_tower()
+                                _write_shard()
+                            except Exception:                    # noqa: BLE001
+                                prog["n_bad"] += 1
+                    del flac_bytes[stem], meta[stem]
+        _run_tower()
+        _write_shard()                                           # shard boundary at tar end if full
+        prog["completed_tars"].append(tar_name)
+        _save_progress()
+        try:
+            os.remove(local)                                     # don't fill the ephemeral disk
+        except OSError:
+            pass
+        done = len(prog["completed_tars"])
+        print(f"  tar {done}/{len(tars)} done | kept={prog['n_kept'] + len(shard_recs)} "
+              f"bl={prog['n_bl']} bad={prog['n_bad']} shards={len(prog['shards'])}", flush=True)
+
+    _run_tower()
+    _write_shard(force=True)
+    if finalize:
+        with open(str(out_dir / "index.json"), "w") as fh:
+            json.dump({"d_audio": d_audio, "shard_size": shard_size, "n_total": prog["n_kept"],
+                       "captions": prog["captions"], "tasks": prog["tasks"],
+                       "shards": prog["shards"]}, fh)
+        if os.path.exists(str(progress_path)):
+            os.remove(str(progress_path))
+        volume.commit()
+    result = {"frame_shard": frame_shard, "repo": repo, "tars": len(prog["completed_tars"]),
+              "kept": prog["n_kept"], "blacklisted": prog["n_bl"], "bad": prog["n_bad"],
+              "shards": len(prog["shards"]), "d_audio": d_audio, "finalized": finalize}
+    print(f"INGEST_WEBDATASET: {result}")
+    return result
+
+
+@app.function(secrets=[hf_secret], cpu=4.0, memory=16384, timeout=1800, env=HF_ENV)
+def peek_hf_audio(repo: str = "Meranti/CLAP_freesound", config: str = "", split: str = "train",
+                  n: int = 3) -> dict:
+    """Recon an audio dataset mirror: configs, features, first rows' keys, id/caption/license
+    fields, and whether audio ships as decodable bytes — BEFORE designing an ingest."""
+    import json
+    import os
+
+    from datasets import get_dataset_config_names, load_dataset
+
+    token = os.environ.get("HF_TOKEN") or None
+    report: dict = {}
+    try:
+        report["configs"] = get_dataset_config_names(repo, trust_remote_code=True, token=token)[:20]
+    except Exception as e:                                       # noqa: BLE001
+        report["configs_error"] = str(e)[:200]
+    ds = load_dataset(repo, config or None, split=split, streaming=True, token=token)
+    report["features"] = {k: str(v)[:80] for k, v in (ds.features or {}).items()} if ds.features else None
+    from datasets import Audio
+    for col in ("audio", "flac", "wav"):
+        try:
+            ds = ds.cast_column(col, Audio(decode=False))
+            report["audio_col"] = col
+            break
+        except Exception:                                        # noqa: BLE001
+            continue
+    rows = []
+    try:
+        it = iter(ds)
+    except Exception as e:                                       # noqa: BLE001
+        report["iter_error"] = str(e)[:300]
+        it = iter(())
+    for i, row in enumerate(it):
+        if i >= n:
+            break
+        keys = sorted(row.keys())
+        sample = {k: (f"<bytes {len(row[k]['bytes'])}>" if isinstance(row[k], dict) and row[k].get("bytes")
+                      else str(row[k])[:120]) for k in keys if k != "audio"}
+        a = row.get("audio")
+        sample["audio"] = (f"<dict keys={sorted(a.keys())}, bytes={'yes' if a.get('bytes') else 'no'}, "
+                           f"path={str(a.get('path'))[:60]}>" if isinstance(a, dict) else str(type(a)))
+        rows.append(sample)
+    report["sample_rows"] = rows
+    print("PEEK_HF_AUDIO:", json.dumps(report, indent=2)[:4000])
+    return report
 
 
 @app.function(cpu=2.0, timeout=600, env=HF_ENV)
@@ -1873,12 +2175,15 @@ def train_frames(frame_shard: str = "audiocaps4k_post_proj", steps: int = 2000,
                  use_text_cache: bool = False, accum_steps: int = 1,
                  bank_negatives: bool = False, peak_lr: float = 0.0,
                  d_resampler: int = 256, n_query: int = 64,
-                 fn_mask_threshold: float = 0.0, soft_label_beta: float = 0.0) -> dict:
+                 fn_mask_threshold: float = 0.0, soft_label_beta: float = 0.0,
+                 text_cache_tag: str = "", num_workers: int = 4,
+                 train_max_frames: int = 250) -> dict:
     """L4 wrapper — see _train_frames_impl."""
     return _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                               load_in_4bit, gpu_note, whiten_text, run_tag, eval_816_shard,
                               use_text_cache, accum_steps, bank_negatives, peak_lr,
-                              d_resampler, n_query, fn_mask_threshold, soft_label_beta)
+                              d_resampler, n_query, fn_mask_threshold, soft_label_beta,
+                              text_cache_tag, num_workers, train_max_frames)
 
 
 @app.function(gpu="H100", volumes={VOL: volume}, secrets=[hf_secret], timeout=16 * 3600,
@@ -1894,12 +2199,15 @@ def train_frames_a100(frame_shard: str = "audiocaps4k_post_proj", steps: int = 4
                       use_text_cache: bool = False, accum_steps: int = 1,
                       bank_negatives: bool = False, peak_lr: float = 0.0,
                       d_resampler: int = 256, n_query: int = 64,
-                      fn_mask_threshold: float = 0.0, soft_label_beta: float = 0.0) -> dict:
+                      fn_mask_threshold: float = 0.0, soft_label_beta: float = 0.0,
+                      text_cache_tag: str = "", num_workers: int = 4,
+                      train_max_frames: int = 250) -> dict:
     """A100-80GB wrapper — bigger batch (more negatives) + more RAM for larger frame sets."""
     return _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                               load_in_4bit, gpu_note, whiten_text, run_tag, eval_816_shard,
                               use_text_cache, accum_steps, bank_negatives, peak_lr,
-                              d_resampler, n_query, fn_mask_threshold, soft_label_beta)
+                              d_resampler, n_query, fn_mask_threshold, soft_label_beta,
+                              text_cache_tag, num_workers, train_max_frames)
 
 
 # --------------------------------------------------------------------------- #
@@ -2103,6 +2411,7 @@ def rescore_frames(frame_shard: str = "audiocaps10k_post_proj", steps: int = 400
 
 
 def _score_816_protocol(model, cfg, collator, eval_shard, *, device, dim=0, task="sound",
+                        native_text_template=False,
                         id_allowlist=None) -> dict:
     """Score a LOADED model on a multi-caption eval set (min-rank over the N refs per clip).
 
@@ -2155,8 +2464,25 @@ def _score_816_protocol(model, cfg, collator, eval_shard, *, device, dim=0, task
     t_chunks, bs = [], 64
     with torch.no_grad():                                       # ALL refs: encode_text -> whiten -> MRL
         for i in range(0, len(flat_caps), bs):
-            ids, mask = collator._text_ids(
-                [{"instruction": instr, "text": c} for c in flat_caps[i:i + bs]])
+            batch_caps = flat_caps[i:i + bs]
+            if native_text_template:
+                # A0 fix: a model trained on NATIVE chat-template targets must be evaluated
+                # with native-format queries — old bare-format eval text is a manifold
+                # mismatch that tanks the score (measured: 0.370 vs in-domain 0.830).
+                hf_tok = getattr(collator.tokenizer, "hf", collator.tokenizer)
+                bodies = [f"<|im_start|>system\n{instr}<|im_end|>\n"
+                          f"<|im_start|>user\n{c}<|im_end|>\n"
+                          f"<|im_start|>assistant\n" for c in batch_caps]
+                seqs = [hf_tok.encode(b, add_special_tokens=False)[:254] for b in bodies]
+                L = max(len(q) for q in seqs)
+                ids = torch.full((len(seqs), L), cfg.pad_id, dtype=torch.long)
+                mask = torch.zeros(len(seqs), L, dtype=torch.long)
+                for b, q in enumerate(seqs):
+                    ids[b, : len(q)] = torch.tensor(q)
+                    mask[b, : len(q)] = 1
+            else:
+                ids, mask = collator._text_ids(
+                    [{"instruction": instr, "text": c} for c in batch_caps])
             raw = model.encode_text(ids.to(device), mask.to(device))
             t_chunks.append(mrl_truncate_normalize(model.text_whitening(raw), dim).cpu())
     if was_training:
@@ -2174,7 +2500,8 @@ def _score_816_protocol(model, cfg, collator, eval_shard, *, device, dim=0, task
               memory=32768, env=HF_ENV)
 def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audiocaps10k_post_proj",
                 steps: int = 4000, run_tag: str = "", load_in_4bit: bool = True,
-                task: str = "sound", dim: int = 0, id_allowlist_file: str = "") -> dict:
+                task: str = "sound", dim: int = 0, id_allowlist_file: str = "",
+                native_text_template: bool = False) -> dict:
     """Score a saved connector on the PUBLISHED multi-caption protocol (min-rank over the 5 refs).
 
     ``eval_shard`` is a multi-caption eval set built by ``ingest_audiocaps_eval`` (index has
@@ -2200,14 +2527,24 @@ def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audioc
             id_allowlist = set(json.load(fh))
         print(f"exact-split filter: {len(id_allowlist)} canonical ids from {id_allowlist_file}")
 
-    cfg0 = FusionConfig(n_query=64, d_resampler=256)
+    # Build the model at the CKPT's own architecture (d_resampler/n_query vary across the
+    # capacity arms — hardcoding 256 here crashed on d384+ checkpoints).
+    import dataclasses
+    ckpt_path = str(checkpoints_dir() / f"p1frames_{ckpt_shard}_step{steps}{run_tag}.pt")
+    ckpt = torch.load(ckpt_path, map_location=dev)
+    flds = {f.name for f in dataclasses.fields(FusionConfig)}
+    saved = {k: v for k, v in ckpt.get("config", {}).items() if k in flds}
+    cfg0 = FusionConfig(**{**saved, "d_audio": d_audio}) if saved else FusionConfig(n_query=64, d_resampler=256)
+    print(f"ckpt arch: d_resampler={cfg0.d_resampler} n_query={cfg0.n_query}")
+    if "base_4bit" in ckpt and bool(ckpt["base_4bit"]) != bool(load_in_4bit):
+        # Measured 2026-07-04: scoring a bf16-trained ckpt through a 4-bit base cost
+        # 5.6 R@10 pts (0.503 -> 0.448). Precision mismatch silently corrupts scores.
+        print(f"WARNING: ckpt was trained with base_4bit={ckpt['base_4bit']} but rescoring with "
+              f"load_in_4bit={load_in_4bit} — scores will NOT match training-time eval!")
     cfg, embed_tokens, base_lm, tokenizer = load_base(
         cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit, d_audio=d_audio)
     model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder=None)
     model.resampler.to(dev).float()
-
-    ckpt_path = str(checkpoints_dir() / f"p1frames_{ckpt_shard}_step{steps}{run_tag}.pt")
-    ckpt = torch.load(ckpt_path, map_location=dev)
     model.resampler.load_state_dict(ckpt["resampler"])
     if isinstance(model.logit_scale, torch.nn.Parameter):
         model.logit_scale.data = ckpt["logit_scale"].to(dev)
@@ -2219,6 +2556,7 @@ def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audioc
     out = {"ckpt_shard": ckpt_shard, "steps": steps, "run_tag": run_tag,
            "text_whitening_fitted": int(model.text_whitening.fitted),
            **_score_816_protocol(model, cfg, collator, eval_shard, device=dev, dim=dim, task=task,
+                                 native_text_template=native_text_template,
                                  id_allowlist=id_allowlist)}
     with open(str(checkpoints_dir() / f"score816_{eval_shard}__{ckpt_shard}_step{steps}{run_tag}.json"), "w") as fh:
         json.dump(out, fh, indent=2)
@@ -2230,7 +2568,8 @@ def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audioc
 @app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=12 * 3600,
               memory=32768, env=HF_ENV)
 def precompute_text_cache(frame_shard: str = "audiocaps10k_sharded", batch: int = 64,
-                          load_in_4bit: bool = True) -> dict:
+                          load_in_4bit: bool = True, native_template: bool = False,
+                          cache_tag: str = "") -> dict:
     """STEP 2: cache the frozen-base RAW pooled text embedding for every clip, beside its frame shard.
 
     Because the base + captions are frozen, text embeddings are deterministic — precompute them ONCE so
@@ -2244,7 +2583,8 @@ def precompute_text_cache(frame_shard: str = "audiocaps10k_sharded", batch: int 
 
     from fusion_embedding.config import FusionConfig
     from fusion_embedding.model import FusionEmbeddingModel
-    from fusion_embedding.data import FrameCollator, instruction_for, write_text_emb_shard
+    from fusion_embedding.data import (FrameCollator, instruction_for, text_emb_shard_path,
+                                       write_text_emb_shard)
     from fusion_embedding.hf_components import load_base
     from fusion_embedding.paths import frames_dir
     from fusion_embedding.data import TASK_INSTRUCTIONS
@@ -2269,17 +2609,40 @@ def precompute_text_cache(frame_shard: str = "audiocaps10k_sharded", batch: int 
             idx = json.load(fh)
         for sname in idx["shards"]:
             sp = fd / sname
+            import os as _os
+            if _os.path.exists(text_emb_shard_path(sp, cache_tag)):   # resume: shard already cached
+                print(f"  {nm}/{sname}: cache exists, skipping", flush=True)
+                continue
             shard = torch.load(str(sp), map_location="cpu", weights_only=False)
             texts, tasks = shard["text"], shard["task"]
             embs = []
             for i in range(0, len(texts), batch):
-                items = [{"instruction": instruction_for(t if t in TASK_INSTRUCTIONS else "sound"),
-                          "text": tx} for tx, t in zip(texts[i:i + batch], tasks[i:i + batch])]
-                ids, mask = collator._text_ids(items)
+                if native_template:
+                    # PHASE A0: the base's OFFICIAL chat-template dialect — instruction in the
+                    # SYSTEM turn, caption in the USER turn, ends with the assistant opener,
+                    # last-token pool. Our bare-sequence format is off-manifold for the frozen
+                    # tower (measured: text→image 0.046 bare vs 0.236 native, Phase 0).
+                    bodies = []
+                    for tx, t in zip(texts[i:i + batch], tasks[i:i + batch]):
+                        instr = instruction_for(t if t in TASK_INSTRUCTIONS else "sound")
+                        bodies.append(f"<|im_start|>system\n{instr}<|im_end|>\n"
+                                      f"<|im_start|>user\n{tx}<|im_end|>\n"
+                                      f"<|im_start|>assistant\n")
+                    seqs = [tokenizer.encode(b, add_special_tokens=False)[:254] for b in bodies]
+                    L = max(len(q) for q in seqs)
+                    ids = torch.full((len(seqs), L), cfg.pad_id, dtype=torch.long)
+                    mask = torch.zeros(len(seqs), L, dtype=torch.long)
+                    for b, q in enumerate(seqs):
+                        ids[b, : len(q)] = torch.tensor(q)
+                        mask[b, : len(q)] = 1
+                else:
+                    items = [{"instruction": instruction_for(t if t in TASK_INSTRUCTIONS else "sound"),
+                              "text": tx} for tx, t in zip(texts[i:i + batch], tasks[i:i + batch])]
+                    ids, mask = collator._text_ids(items)
                 with torch.no_grad():
                     raw = model.encode_text(ids.to(dev), mask.to(dev))   # RAW pooled [B, d_llm]
                 embs.append(raw.float().cpu())
-            write_text_emb_shard(sp, torch.cat(embs))
+            write_text_emb_shard(sp, torch.cat(embs), cache_tag)
             total += len(texts)
             volume.commit()
             print(f"  {nm}/{sname}: cached {len(texts)} (total {total})", flush=True)
@@ -2291,6 +2654,532 @@ def precompute_text_cache(frame_shard: str = "audiocaps10k_sharded", batch: int 
               "sources": len(shard_names)}
     print(f"TEXT_CACHE: {result}")
     return result
+
+
+@app.function(gpu="L4", secrets=[hf_secret], volumes={VOL: volume}, cpu=8.0, memory=65536,
+              timeout=4 * 3600, env=HF_ENV)
+def phase0_crossmodal(ckpt_shard: str = "audiocaps10k_sharded,fsd50k_train,wavcaps_audioset_sl_full",
+                      steps: int = 1800, run_tag: str = "_cap384_1800",
+                      dataset: str = "mteb/VGGSound_AV_RETRIEVAL", limit: int = 0,
+                      frame_index: int = 75, batch_audio: int = 8,
+                      caption_field: str = "audio_caption",
+                      image_template: str = "", text_query_template: str = "",
+                      use_native_templates: bool = False, out_tag: str = "") -> dict:
+    """PHASE 0 — the unified-space existence proof (docs/sota_redesign.md prerequisite).
+
+    Question: does audio actually land in the frozen base's SHARED space, such that
+    audio<->image retrieval works through the text bridge (ImageBind property)? Never tested.
+    Known geometry hazard: audio was trained to match WHITENED text; the base's image
+    embeddings live in the RAW space. We score both geometries and the base-native checks:
+
+      audio->image / image->audio :  vs raw images  AND  vs whitened images
+      text ->image / image->text  :  raw vs whitened (base-native health + whitening safety)
+      audio->text  (sanity — this is what we trained)
+
+    Data: mteb/VGGSound_AV_RETRIEVAL (696 pairs, mp4+wav in-parquet; VGGSound is in our
+    training blacklist -> zero leakage). Images use the base's NATIVE vision forward
+    (full Qwen3VLModel), NOT a hand-rolled splice — Qwen3-VL may inject vision features at
+    multiple layers, so only the native path is faithful. Read-only; ~$3 on L4."""
+    import io
+    import json
+
+    import numpy as np
+    import soundfile as sf
+    import torch
+    from transformers import AutoFeatureExtractor, AutoModel, AutoProcessor
+
+    from fusion_embedding.config import FusionConfig
+    from fusion_embedding.data import instruction_for
+    from fusion_embedding.hf_components import BaseLMAdapter, load_audio_tower
+    from fusion_embedding.model import FusionEmbeddingModel, last_token_pool, mrl_truncate_normalize
+    from fusion_embedding.paths import checkpoints_dir
+    from fusion_embedding.train_stage1 import retrieval_report
+
+    import dataclasses
+    dev = "cuda"
+    if use_native_templates and not image_template:
+        # The OFFICIAL Qwen3-VL-Embedding protocol (verified against QwenLM/Qwen3-VL-Embedding
+        # src/models/qwen3_vl_embedding.py + chat_template.jinja + the vLLM notebook output):
+        # chat template, instruction in the SYSTEM turn (documents get the default one, queries
+        # get the retrieval one), rendered with add_generation_prompt=True -> input ends with
+        # "<|im_start|>assistant\n" and the embedding is the last non-pad token's hidden state.
+        image_template = ("<|im_start|>system\nRepresent the user's input.<|im_end|>\n"
+                          "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n"
+                          "<|im_start|>assistant\n")
+        text_query_template = ("<|im_start|>system\nRetrieve images or text relevant to the "
+                               "user's query.<|im_end|>\n"
+                               "<|im_start|>user\n{text}<|im_end|>\n"
+                               "<|im_start|>assistant\n")
+    # --- the trained audio path, at the ckpt's own architecture + precision (bf16) --------
+    ckpt = torch.load(str(checkpoints_dir() / f"p1frames_{ckpt_shard}_step{steps}{run_tag}.pt"),
+                      map_location="cpu", weights_only=False)
+    flds = {f.name for f in dataclasses.fields(FusionConfig)}
+    cfg = FusionConfig(**{k: v for k, v in ckpt["config"].items() if k in flds})
+    print(f"ckpt arch: d_resampler={cfg.d_resampler} n_query={cfg.n_query} d_audio={cfg.d_audio}")
+
+    full = AutoModel.from_pretrained(BASE_MODEL, trust_remote_code=True, dtype=torch.bfloat16)
+    full = full.to(dev).eval()
+    for p in full.parameters():
+        p.requires_grad_(False)
+    proc = AutoProcessor.from_pretrained(BASE_MODEL, trust_remote_code=True)
+    tok = proc.tokenizer
+    tower, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16)
+    fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True)
+
+    model = FusionEmbeddingModel(cfg, full.get_input_embeddings(),
+                                 BaseLMAdapter(full.language_model), audio_encoder=tower)
+    model.resampler.to(dev).float()
+    model.resampler.load_state_dict(ckpt["resampler"])
+    model.text_whitening.load_state_dict(ckpt["text_whitening"])
+    model.eval()
+    whiten = model.text_whitening
+    eos_str = tok.decode([cfg.eos_id])
+
+    # --- stream + decode the 696 AV pairs -------------------------------------------------
+    import av as _av
+    from datasets import Audio as DAudio, Video as DVideo, load_dataset
+    ds = load_dataset(dataset, split="test", streaming=True)
+    ds = ds.cast_column("audio", DAudio(decode=False)).cast_column("video", DVideo(decode=False))
+
+    def _mid_frame(mp4_bytes):
+        with _av.open(io.BytesIO(mp4_bytes)) as c:
+            last = None
+            for i, fr in enumerate(c.decode(video=0)):
+                last = fr
+                if i == frame_index:
+                    break
+            return last.to_image() if last is not None else None
+
+    mels, images, captions = [], [], []
+    n_bad = 0
+    for i, row in enumerate(ds):
+        if limit and len(mels) >= limit:
+            break
+        try:
+            wav, sr0 = sf.read(io.BytesIO(row["audio"]["bytes"]), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sr0 != fe.sampling_rate:
+                import librosa
+                wav = librosa.resample(wav, orig_sr=sr0, target_sr=fe.sampling_rate)
+            feats = fe(wav, sampling_rate=fe.sampling_rate, return_tensors="pt",
+                       return_attention_mask=True, padding="max_length", truncation=True)
+            mel = feats["input_features"][0]
+            am = feats.get("attention_mask")
+            if am is not None:
+                mel = mel[:, : int(am[0].sum().item())]
+            img = _mid_frame(row["video"]["bytes"])
+            if img is None:
+                n_bad += 1
+                continue
+            mels.append(mel)
+            images.append(img.convert("RGB"))
+            captions.append(str(row.get(caption_field) or row.get("audio_caption")
+                                or row.get("video_caption") or ""))
+        except Exception as e:                                     # noqa: BLE001
+            n_bad += 1
+            if n_bad <= 3:
+                print(f"decode fail row {i}: {type(e).__name__}: {e}")
+    n = len(mels)
+    print(f"decoded {n} pairs ({n_bad} failed)")
+
+    # --- embed: audio via our connector, text as trained, images via the NATIVE forward ---
+    @torch.no_grad()
+    def embed_audio():
+        out = []
+        ids_row = [cfg.audio_pad_id] * cfg.n_query + [cfg.eos_id]
+        for s in range(0, n, batch_audio):
+            batch = mels[s: s + batch_audio]
+            L = max(m.shape[1] for m in batch)
+            mel = torch.zeros(len(batch), batch[0].shape[0], L)
+            mm = torch.zeros(len(batch), L, dtype=torch.bool)
+            for b, m in enumerate(batch):
+                mel[b, :, : m.shape[1]] = m
+                mm[b, : m.shape[1]] = True
+            audio_tok = model.audio_tokens(mel.to(dev), mm.to(dev))
+            ids = torch.tensor([ids_row] * len(batch), device=dev)
+            pooled = model.encode_audio(ids, torch.ones_like(ids), audio_tok)
+            out.append(pooled.float().cpu())
+        return torch.cat(out)
+
+    @torch.no_grad()
+    def embed_text():
+        out = []
+        instr = instruction_for("sound")
+        for s in range(0, n, 32):
+            batch_caps = captions[s: s + 32]
+            if text_query_template:                               # native protocol: {text} substituted
+                bodies = [text_query_template.replace("{text}", c) for c in batch_caps]
+                seqs = [tok.encode(b, add_special_tokens=False)[:254] for b in bodies]
+            else:                                                  # our training format
+                seqs = [tok.encode(f"{instr} {c}".strip(), add_special_tokens=False)[:126] + [cfg.eos_id]
+                        for c in batch_caps]
+            L = max(len(q) for q in seqs)
+            ids = torch.full((len(seqs), L), cfg.pad_id, dtype=torch.long)
+            mask = torch.zeros(len(seqs), L, dtype=torch.long)
+            for b, q in enumerate(seqs):
+                ids[b, : len(q)] = torch.tensor(q)
+                mask[b, : len(q)] = 1
+            pooled = model.encode_text(ids.to(dev), mask.to(dev))
+            out.append(pooled.float().cpu())
+        return torch.cat(out)
+
+    @torch.no_grad()
+    def embed_images():
+        out = []
+        template = image_template or f"<|vision_start|><|image_pad|><|vision_end|>{eos_str}"
+        for img in images:
+            inputs = proc(text=[template], images=[img], return_tensors="pt").to(dev)
+            h = full(**inputs).last_hidden_state
+            out.append(last_token_pool(h, inputs["attention_mask"]).float().cpu())
+        return torch.cat(out)
+
+    a = embed_audio()                                              # whitened-space by training
+    t_raw = embed_text()
+    t = whiten(t_raw)                                              # as trained
+    im_raw = embed_images()
+    im_wh = whiten(im_raw)
+    # Per-modality centering — the standard modality-gap fix: each modality's OWN mean removed
+    # (unlike whitening, which applies TEXT-fitted stats to everything).
+    a_c, t_c, im_c = a - a.mean(0), t_raw - t_raw.mean(0), im_raw - im_raw.mean(0)
+    print(f"embedded: audio {tuple(a.shape)} text {tuple(t.shape)} image {tuple(im_raw.shape)}")
+
+    def _score(x, y):
+        xn = mrl_truncate_normalize(x, cfg.mrl_default)
+        yn = mrl_truncate_normalize(y, cfg.mrl_default)
+        r = retrieval_report(xn, yn)
+        return {k: round(float(v), 4) for k, v in r.items()}
+
+    results = {
+        "audio_vs_image_RAW": _score(a, im_raw),                   # geometry-mismatch baseline
+        "audio_vs_image_WHITENED": _score(a, im_wh),               # text-stats isomorphism
+        "audio_vs_image_CENTERED": _score(a_c, im_c),              # per-modality gap fix
+        "text_vs_image_RAW": _score(t_raw, im_raw),                # base-native health
+        "text_vs_image_WHITENED": _score(t, im_wh),
+        "text_vs_image_CENTERED": _score(t_c, im_c),
+        "audio_vs_text_sanity": _score(a, t),                      # what we actually trained
+    }
+    out = {"dataset": dataset, "n_pairs": n, "decode_failed": n_bad, "ckpt": run_tag,
+           "caption_field": caption_field,
+           "image_template": image_template or "minimal-span (default)",
+           "text_query_template": text_query_template or "training-format (default)",
+           "chance_R@10": round(10.0 / max(n, 1), 4), "results": results}
+    name = f"phase0_crossmodal{run_tag}{('_' + out_tag) if out_tag else ''}.json"
+    with open(str(checkpoints_dir() / name), "w") as fh:
+        json.dump(out, fh, indent=2)
+    volume.commit()
+    print("PHASE0:", json.dumps(out, indent=2))
+    return out
+
+
+@app.function(gpu="L4", secrets=[hf_secret], volumes={VOL: volume}, cpu=8.0, memory=65536,
+              timeout=4 * 3600, env=HF_ENV)
+def probe_tower_layers(dataset: str = "ashraq/esc50", limit: int = 0,
+                       probe_epochs: int = 300, out_tag: str = "esc50") -> dict:
+    """PHASE A1 — does the Whisper-AT layer effect replicate on OUR Omni tower?
+
+    Published (vanilla Whisper): last-layer 20.3 mAP vs weighted-all-layers 32.4 on event
+    tagging — deeper ASR layers discard non-speech sound. Our tower is Whisper-INITIALIZED
+    but continued-trained on general audio, so the effect must be measured, not assumed.
+
+    Method: ESC-50 (2000 clips, 50 classes, canonical 5 folds; never in our training data)
+    → frozen tower with a forward hook on every encoder layer → mean-pooled per-layer clip
+    vectors → linear probe per feature set with 5-fold CV. Reports accuracy for: each layer,
+    the last layer, the post_proj output (our CURRENT tap), and a learnable weighted average
+    of all layers. Decision: weighted-avg >> last-layer ⇒ multi-layer taps are real gains."""
+    import io
+    import json
+
+    import numpy as np
+    import soundfile as sf
+    import torch
+    from transformers import AutoFeatureExtractor
+
+    from fusion_embedding.hf_components import load_audio_tower
+    from fusion_embedding.paths import checkpoints_dir
+
+    dev = "cuda"
+    tower, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16)  # post_proj adapter
+    enc = tower.encoder
+    fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True)
+    layers = list(enc.layers)
+    n_layers = len(layers)
+    print(f"tower: {n_layers} encoder layers, d_model={layers[0].fc1.in_features}, post_proj d={d_audio}")
+
+    captured: list = [None] * n_layers
+
+    def _mk_hook(i):
+        def _hook(module, args, output):
+            h = output[0] if isinstance(output, tuple) else output
+            captured[i] = h.detach().float().mean(dim=-2).squeeze().cpu()   # mean over time
+        return _hook
+
+    hooks = [layers[i].register_forward_hook(_mk_hook(i)) for i in range(n_layers)]
+
+    from datasets import Audio as DAudio, load_dataset
+    ds = load_dataset(dataset, split="train", streaming=True).cast_column("audio", DAudio(decode=False))
+
+    per_layer, post_proj_feats, labels, folds = [], [], [], []
+    import librosa
+    for row in ds:
+        if limit and len(labels) >= limit:
+            break
+        wav, sr0 = sf.read(io.BytesIO(row["audio"]["bytes"]), dtype="float32")
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if sr0 != fe.sampling_rate:
+            wav = librosa.resample(wav, orig_sr=sr0, target_sr=fe.sampling_rate)
+        feats = fe(wav, sampling_rate=fe.sampling_rate, return_tensors="pt",
+                   return_attention_mask=True, padding="max_length", truncation=True)
+        mel = feats["input_features"][0]
+        am = feats.get("attention_mask")
+        if am is not None:
+            mel = mel[:, : int(am[0].sum().item())]
+        with torch.no_grad():
+            frames, fmask = tower(mel.unsqueeze(0).to(dev),
+                                  torch.ones(1, mel.shape[1], dtype=torch.bool, device=dev))
+        t = int(fmask[0].sum().item())
+        post_proj_feats.append(frames[0, :t].float().mean(dim=0).cpu())
+        per_layer.append(torch.stack(list(captured)))              # [n_layers, d_model]
+        labels.append(int(row["target"]))
+        folds.append(int(row["fold"]))
+        if len(labels) % 250 == 0:
+            print(f"  {len(labels)} clips featurized", flush=True)
+    for h in hooks:
+        h.remove()
+
+    X_layers = torch.stack(per_layer)                              # [N, L, d_model]
+    X_post = torch.stack(post_proj_feats)                          # [N, d_audio]
+    y = torch.tensor(labels)
+    fold_t = torch.tensor(folds)
+    n, n_classes = len(y), int(y.max()) + 1
+    print(f"featurized {n} clips, {n_classes} classes, folds {sorted(set(folds))}")
+
+    def _probe(X, weighted=False):
+        """5-fold CV linear probe (standardized features, Adam). X: [N,d] or [N,L,d] if weighted."""
+        accs = []
+        for k in sorted(set(folds)):
+            tr, te = fold_t != k, fold_t == k
+            if weighted:
+                Xtr, Xte = X[tr].to(dev), X[te].to(dev)
+                mu, sd = Xtr.mean((0,)), Xtr.std((0,)) + 1e-5
+                Xtr, Xte = (Xtr - mu) / sd, (Xte - mu) / sd
+                w = torch.zeros(X.shape[1], device=dev, requires_grad=True)
+                lin = torch.nn.Linear(X.shape[2], n_classes).to(dev)
+                opt = torch.optim.Adam([w] + list(lin.parameters()), lr=3e-3)
+                for _ in range(probe_epochs):
+                    opt.zero_grad()
+                    feats_tr = torch.einsum("l,nld->nd", torch.softmax(w, 0), Xtr)
+                    loss = torch.nn.functional.cross_entropy(lin(feats_tr), y[tr].to(dev))
+                    loss.backward(); opt.step()
+                with torch.no_grad():
+                    pred = lin(torch.einsum("l,nld->nd", torch.softmax(w, 0), Xte)).argmax(1)
+            else:
+                Xtr, Xte = X[tr].to(dev), X[te].to(dev)
+                mu, sd = Xtr.mean(0), Xtr.std(0) + 1e-5
+                Xtr, Xte = (Xtr - mu) / sd, (Xte - mu) / sd
+                lin = torch.nn.Linear(X.shape[1], n_classes).to(dev)
+                opt = torch.optim.Adam(lin.parameters(), lr=3e-3)
+                for _ in range(probe_epochs):
+                    opt.zero_grad()
+                    loss = torch.nn.functional.cross_entropy(lin(Xtr), y[tr].to(dev))
+                    loss.backward(); opt.step()
+                with torch.no_grad():
+                    pred = lin(Xte).argmax(1)
+            accs.append(float((pred.cpu() == y[te]).float().mean()))
+        return round(sum(accs) / len(accs), 4)
+
+    acc_by_layer = {f"layer_{i:02d}": _probe(X_layers[:, i]) for i in range(n_layers)}
+    results = {
+        "post_proj_CURRENT_TAP": _probe(X_post),
+        "last_layer": acc_by_layer[f"layer_{n_layers - 1:02d}"],
+        "best_single_layer": max(acc_by_layer.items(), key=lambda kv: kv[1]),
+        "weighted_all_layers": _probe(X_layers, weighted=True),
+        "acc_by_layer": acc_by_layer,
+    }
+    out = {"dataset": dataset, "n_clips": n, "n_layers": n_layers, "results": results}
+    with open(str(checkpoints_dir() / f"probe_tower_layers_{out_tag}.json"), "w") as fh:
+        json.dump(out, fh, indent=2)
+    volume.commit()
+    print("PROBE_TOWER:", json.dumps({k: v for k, v in results.items() if k != "acc_by_layer"}, indent=2))
+    print("by layer:", json.dumps(results["acc_by_layer"]))
+    return out
+
+
+# Separate image for the ImageBind baseline: its pinned deps (timm 0.6.7, torch<=2.1-era)
+# must not contaminate the training image.
+imagebind_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("git", "ffmpeg")
+    .pip_install("torch==2.1.2", "torchvision==0.16.2", "torchaudio==2.1.2",
+                 extra_index_url="https://download.pytorch.org/whl/cu121")
+    .pip_install("pytorchvideo==0.1.5", "timm==0.9.16", "ftfy", "regex", "einops",
+                 "fvcore", "iopath", "soundfile", "librosa", "datasets>=3.2",
+                 "av>=10,<13", "pillow", "numpy<2")
+    .run_commands("pip install --no-deps git+https://github.com/facebookresearch/ImageBind.git")
+    .add_local_python_source("fusion_embedding")
+)
+
+
+@app.function(gpu="L4", image=imagebind_image, secrets=[hf_secret], volumes={VOL: volume},
+              cpu=8.0, memory=65536, timeout=4 * 3600, env=HF_ENV)
+def imagebind_vggsound(dataset: str = "mteb/VGGSound_AV_RETRIEVAL", limit: int = 0,
+                       frame_index: int = 75, batch: int = 24) -> dict:
+    """Head-to-head baseline: ImageBind-Huge on OUR VGGSound-696 cross-modal protocol.
+
+    Same 696 pairs, same middle-frame extraction, same retrieval_report — directly
+    comparable to phase0_crossmodal results. ImageBind is the reference model for emergent
+    audio<->image alignment; nobody publishes it on this exact protocol, so this row makes
+    our cross-modal table a won/lost comparison instead of a claim-by-default."""
+    import io
+    import json
+    import os
+
+    import soundfile as sf
+    import torch
+
+    from fusion_embedding.train_stage1 import retrieval_report
+    from fusion_embedding.paths import checkpoints_dir, hf_cache_dir
+
+    # imagebind downloads its 4.5GB ckpt to ./.checkpoints — persist it on the Volume.
+    workdir = str(hf_cache_dir() / "imagebind")
+    os.makedirs(workdir, exist_ok=True)
+    os.chdir(workdir)
+    from imagebind import data as ib_data
+    from imagebind.models import imagebind_model
+    from imagebind.models.imagebind_model import ModalityType
+
+    dev = "cuda"
+    model = imagebind_model.imagebind_huge(pretrained=True).eval().to(dev)
+
+    import av as _av
+    from datasets import Audio as DAudio, Video as DVideo, load_dataset
+    ds = load_dataset(dataset, split="test", streaming=True)
+    ds = ds.cast_column("audio", DAudio(decode=False)).cast_column("video", DVideo(decode=False))
+
+    tmp = "/tmp/ibpairs"
+    os.makedirs(tmp, exist_ok=True)
+    wavs, jpgs, captions = [], [], []
+    n_bad = 0
+    for i, row in enumerate(ds):
+        if limit and len(wavs) >= limit:
+            break
+        try:
+            wav, sr0 = sf.read(io.BytesIO(row["audio"]["bytes"]), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            wp = f"{tmp}/a_{i}.wav"
+            sf.write(wp, wav, sr0)
+            with _av.open(io.BytesIO(row["video"]["bytes"])) as c:
+                last = None
+                for j, fr in enumerate(c.decode(video=0)):
+                    last = fr
+                    if j == frame_index:
+                        break
+            if last is None:
+                n_bad += 1
+                continue
+            jp = f"{tmp}/i_{i}.jpg"
+            last.to_image().convert("RGB").save(jp, quality=92)
+            wavs.append(wp)
+            jpgs.append(jp)
+            captions.append(str(row.get("audio_caption") or ""))
+        except Exception as e:                                     # noqa: BLE001
+            n_bad += 1
+            if n_bad <= 3:
+                print(f"decode fail {i}: {type(e).__name__}: {e}")
+    n = len(wavs)
+    print(f"prepared {n} pairs ({n_bad} failed)")
+
+    @torch.no_grad()
+    def embed(modality, paths_or_texts):
+        chunks = []
+        for s in range(0, n, batch):
+            part = paths_or_texts[s: s + batch]
+            if modality == ModalityType.VISION:
+                inp = {modality: ib_data.load_and_transform_vision_data(part, dev)}
+            elif modality == ModalityType.AUDIO:
+                inp = {modality: ib_data.load_and_transform_audio_data(part, dev)}
+            else:
+                inp = {modality: ib_data.load_and_transform_text(part, dev)}
+            emb = model(inp)[modality]
+            chunks.append(torch.nn.functional.normalize(emb, dim=-1).float().cpu())
+            if s % (batch * 8) == 0:
+                print(f"  {modality}: {s + len(part)}/{n}", flush=True)
+        return torch.cat(chunks)
+
+    a = embed(ModalityType.AUDIO, wavs)
+    v = embed(ModalityType.VISION, jpgs)
+    t = embed(ModalityType.TEXT, captions)
+    print(f"embedded audio {tuple(a.shape)} vision {tuple(v.shape)} text {tuple(t.shape)}")
+
+    def _score(x, y):
+        return {k: round(float(vv), 4) for k, vv in retrieval_report(x, y).items()}
+
+    out = {"model": "imagebind_huge", "dataset": dataset, "n_pairs": n,
+           "chance_R@10": round(10.0 / max(n, 1), 4),
+           "results": {"audio_vs_image": _score(a, v),
+                       "audio_vs_text": _score(a, t),
+                       "text_vs_image": _score(t, v)}}
+    with open(str(checkpoints_dir() / "imagebind_vggsound696.json"), "w") as fh:
+        json.dump(out, fh, indent=2)
+    volume.commit()
+    print("IMAGEBIND:", json.dumps(out, indent=2))
+    return out
+
+
+@app.function(secrets=[hf_secret], volumes={VOL: volume}, cpu=8.0, memory=65536, timeout=3600, env=HF_ENV)
+def peek_vision() -> dict:
+    """Phase 0 recon: how does the frozen Qwen3-VL-Embedding base want IMAGES fed to it?
+
+    We have only ever exercised its text path (and spliced audio into it). Introspects the
+    processor class, vision special tokens, the embedding prompt format, and runs one tiny
+    CPU forward with a dummy image to confirm the vision path works end-to-end and to get
+    the pooled-embedding shape. Read-only; nothing is trained or written."""
+    import io
+    import json
+
+    import numpy as np
+    import torch
+    from PIL import Image
+    from transformers import AutoModel, AutoProcessor, AutoTokenizer
+
+    report: dict = {}
+    proc = AutoProcessor.from_pretrained(BASE_MODEL, trust_remote_code=True)
+    tok = getattr(proc, "tokenizer", None) or AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
+    report["processor_class"] = type(proc).__name__
+    report["image_processor_class"] = type(getattr(proc, "image_processor", None)).__name__
+    vision_tokens = {t: tok.convert_tokens_to_ids(t) for t in
+                     ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>")
+                     if tok.convert_tokens_to_ids(t) is not None and tok.convert_tokens_to_ids(t) >= 0}
+    report["vision_special_tokens"] = vision_tokens
+    report["chat_template_has_image"] = "image" in (getattr(tok, "chat_template", "") or
+                                                    getattr(proc, "chat_template", "") or "")
+
+    model = AutoModel.from_pretrained(BASE_MODEL, trust_remote_code=True, dtype=torch.float32)
+    model.eval()
+    report["model_class"] = type(model).__name__
+    report["children"] = [n for n, _ in model.named_children()]
+
+    # One tiny forward: dummy 224px image + the embedding-style prompt.
+    img = Image.fromarray((np.random.rand(224, 224, 3) * 255).astype("uint8"))
+    text = "<|vision_start|><|image_pad|><|vision_end|>"           # minimal vision span
+    try:
+        inputs = proc(text=[text], images=[img], return_tensors="pt")
+        report["processor_output_keys"] = sorted(inputs.keys())
+        report["pixel_values_shape"] = list(inputs["pixel_values"].shape) if "pixel_values" in inputs else None
+        report["input_ids_len"] = int(inputs["input_ids"].shape[1])
+        with torch.no_grad():
+            out = model(**inputs, output_hidden_states=False)
+        h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        report["hidden_shape"] = list(h.shape)
+        report["eos_pooled_dim"] = int(h.shape[-1])
+        report["forward_ok"] = True
+    except Exception as e:                                          # noqa: BLE001
+        report["forward_ok"] = False
+        report["error"] = f"{type(e).__name__}: {e}"[:500]
+    print("PEEK_VISION:", json.dumps(report, indent=2, default=str))
+    return report
 
 
 def _infinite_loader(loader):
@@ -2309,7 +3198,8 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                        eval_816_shard="audiocaps_test816", use_text_cache=False,
                        accum_steps=1, bank_negatives=False, peak_lr=0.0,
                        d_resampler=256, n_query=64, fn_mask_threshold=0.0,
-                       soft_label_beta=0.0) -> dict:
+                       soft_label_beta=0.0, text_cache_tag="", num_workers=4,
+                       train_max_frames=250) -> dict:
     import glob
     import itertools
     import json
@@ -2411,12 +3301,20 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
         print(f"sharded: {len(shard_names)} source(s), {len(shard_paths)} shards, {len(captions)} clips "
               f"| train~{n_train_report} eval={len(eval_gidx)} | text_cache={use_text_cache}")
         eval_ds = InMemoryFrameDataset(
-            load_frame_clips(shard_paths, shard_starts, eval_gidx, with_text_emb=use_text_cache))
+            load_frame_clips(shard_paths, shard_starts, eval_gidx, with_text_emb=use_text_cache,
+                             text_emb_tag=text_cache_tag))
+        # shuffle_buffer sized for LONG-clip corpora: FreeSound frames average ~4.5MB/clip, so
+        # 4096 buffered items ~= 18GB RAM PER WORKER (2026-07-06: 6 workers x 4096 exhausted the
+        # container's tensor-share space -> worker death -> silent hang). 1024 + shuffled shard
+        # order keeps randomization adequate at ~4.6GB/worker.
         train_ds = ShardedFrameDataset(shard_paths, shard_starts, exclude=set(eval_gidx),
-                                       shuffle_buffer=4096, seed=0, use_text_emb=use_text_cache)
-        # num_workers=2, prefetch_factor=2 keeps at most ~4 batches resident (was 16 -> shm blowout);
-        # combined with the file_system sharing strategy above this holds at 100K+ scale.
-        loader = DataLoader(train_ds, batch_size=batch_size, collate_fn=collator, num_workers=2,
+                                       shuffle_buffer=1024, seed=0, use_text_emb=use_text_cache,
+                                       text_emb_tag=text_cache_tag,
+                                       max_frames=int(train_max_frames))
+        # prefetch_factor=2 + file_system sharing avoids the shm blowout (was workers4xprefetch4).
+        # Workers scale with corpus: 2 sufficed at 131K; 484K/940 shards starved the H100 to
+        # ~55s/step (2026-07-06) -> parameterized, default 4.
+        loader = DataLoader(train_ds, batch_size=batch_size, collate_fn=collator, num_workers=int(num_workers),
                             persistent_workers=True, prefetch_factor=2, drop_last=True)
     else:
         # Legacy per-clip .pt files: preload frames into RAM once (still supported for old shards).
@@ -2455,7 +3353,8 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
     if bank_negatives:
         from fusion_embedding.memory_bank import build_corpus_bank_from_cache
         bank = build_corpus_bank_from_cache(shard_paths, captions, model.text_whitening,
-                                            exclude=set(eval_gidx), device=dev)
+                                            exclude=set(eval_gidx), device=dev,
+                                            text_emb_tag=text_cache_tag)
         print(f"text-negative bank: {len(bank)} entries "
               f"({bank.n_duplicate_captions} rows in duplicate-caption groups)")
     loss_fn = FusionContrastiveLoss(cfg)
@@ -2473,7 +3372,8 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
     # d_resampler = shape error; same shapes but different lr/batch = silent corruption).
     resume_key = (f"{frame_shard}|d{cfg.d_resampler}|N{cfg.n_query}|b{batch_size}x{accum_steps}"
                   f"|lr{peak_lr or cfg.lr}|bank{int(bank_negatives)}|4bit{int(load_in_4bit)}"
-                  f"|wh{int(whiten_text)}|fn{cfg.fn_mask_threshold}|sl{cfg.soft_label_beta}")
+                  f"|wh{int(whiten_text)}|fn{cfg.fn_mask_threshold}|sl{cfg.soft_label_beta}"
+                  f"|tc{text_cache_tag}")
     start_step = load_resume_ckpt(resume_path, model, opt, sched, total_steps=steps,
                                   config_key=resume_key)
     print(f"RESUME: continuing from step {start_step}/{steps}" if start_step > 0
@@ -2568,7 +3468,8 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
     score816 = None
     if eval_816_shard and (frames_dir(eval_816_shard) / "index.json").exists():
         try:
-            score816 = _score_816_protocol(model, cfg, collator, eval_816_shard, device=dev)
+            score816 = _score_816_protocol(model, cfg, collator, eval_816_shard, device=dev,
+                                           native_text_template=bool(text_cache_tag == "_native"))
             print(f"816-protocol ({eval_816_shard}, {score816['n_clips']} clips): "
                   f"a2t R@1 {score816['a2t_R@1']:.3f} R@5 {score816['a2t_R@5']:.3f} "
                   f"R@10 {score816['a2t_R@10']:.3f} mAP@10 {score816['a2t_mAP@10']:.3f}")
@@ -2582,6 +3483,7 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
     torch.save({"resampler": model.resampler.state_dict(),
                 "logit_scale": model.logit_scale.detach().cpu(),
                 "text_whitening": model.text_whitening.state_dict(),
+                "base_4bit": bool(load_in_4bit),   # rescoring MUST match the training precision
                 "config": cfg.__dict__, "frame_shard": frame_shard, "steps": steps}, ckpt)
     result = {
         "gpu": torch.cuda.get_device_name(0), "frame_shard": frame_shard, "d_audio": d_audio,
