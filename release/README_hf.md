@@ -89,6 +89,8 @@ retrievals are organized by sound. Real examples from this checkpoint on VGGSoun
 
 ![Audio-to-image retrieval examples](assets/audio_to_image_gallery.png)
 
+*Example frames from the [VGGSound](https://www.robots.ox.ac.uk/~vgg/data/vggsound/) dataset (CC-BY-4.0), shown for evaluation illustration.*
+
 *Direct hits* — the clip's own frame is returned in the top 5, among the same kind of scene:
 
 | Sound | Top-5 retrieval | Exact frame |

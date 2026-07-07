@@ -276,6 +276,8 @@ looks like (query clip's frame left; green = the clip's exact frame among the to
 
 ![Audio-to-image retrieval examples](assets/audio_to_image_gallery.png)
 
+*Example frames from the [VGGSound](https://www.robots.ox.ac.uk/~vgg/data/vggsound/) dataset (CC-BY-4.0), shown for evaluation illustration.*
+
 Text, image, and video performance is the frozen base model's published MMEB-V2 results,
 unchanged by construction.
 
