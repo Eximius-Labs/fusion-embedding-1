@@ -2874,6 +2874,211 @@ def phase0_crossmodal(ckpt_shard: str = "audiocaps10k_sharded,fsd50k_train,wavca
 
 @app.function(gpu="L4", secrets=[hf_secret], volumes={VOL: volume}, cpu=8.0, memory=65536,
               timeout=4 * 3600, env=HF_ENV)
+def phase0_gallery(ckpt_shard: str = "audiocaps10k_sharded,fsd50k_train,wavcaps_audioset_sl_full",
+                   steps: int = 800, run_tag: str = "_a0native_384_800",
+                   dataset: str = "mteb/VGGSound_AV_RETRIEVAL", limit: int = 0,
+                   frame_index: int = 75, batch_audio: int = 8,
+                   caption_field: str = "audio_caption",
+                   use_native_templates: bool = True, geometry: str = "centered",
+                   k: int = 5, n_queries: int = 24, thumb_px: int = 224,
+                   out_tag: str = "") -> dict:
+    """GALLERY DUMP — the visual, per-query companion to ``phase0_crossmodal``.
+
+    Reproduces the SAME embedding + geometry the model card headlines. Defaults target the
+    released preview checkpoint (``_a0native_384_800``) with native Qwen image templates and
+    per-modality ``centered`` geometry -> audio->image R@10 0.368 on VGGSound-696 (the card
+    number). ``geometry`` is one of raw|whitened|centered and must match how the aggregate is
+    scored. For the first ``n_queries`` audio clips it keeps the top-``k`` retrieved image
+    thumbnails (base64 JPEG) + the true paired frame + where the true image ranked, plus
+    compact ranking for ALL clips and the aggregate audio->image report (asserted to match).
+    READ-ONLY except one result file; ~$1-3 on L4. Non-interfering: touches no training ckpt."""
+    import base64
+    import io
+    import json
+
+    import soundfile as sf
+    import torch
+    from transformers import AutoFeatureExtractor, AutoModel, AutoProcessor
+
+    from fusion_embedding.config import FusionConfig
+    from fusion_embedding.gallery import select_gallery
+    from fusion_embedding.hf_components import BaseLMAdapter, load_audio_tower
+    from fusion_embedding.model import (FusionEmbeddingModel, last_token_pool,
+                                        mrl_truncate_normalize)
+    from fusion_embedding.paths import checkpoints_dir
+    from fusion_embedding.train_stage1 import retrieval_report
+
+    import dataclasses
+    dev = "cuda"
+    ckpt = torch.load(str(checkpoints_dir() / f"p1frames_{ckpt_shard}_step{steps}{run_tag}.pt"),
+                      map_location="cpu", weights_only=False)
+    flds = {f.name for f in dataclasses.fields(FusionConfig)}
+    cfg = FusionConfig(**{k2: v for k2, v in ckpt["config"].items() if k2 in flds})
+    print(f"ckpt arch: d_resampler={cfg.d_resampler} n_query={cfg.n_query} d_audio={cfg.d_audio}")
+
+    full = AutoModel.from_pretrained(BASE_MODEL, trust_remote_code=True, dtype=torch.bfloat16)
+    full = full.to(dev).eval()
+    for p in full.parameters():
+        p.requires_grad_(False)
+    proc = AutoProcessor.from_pretrained(BASE_MODEL, trust_remote_code=True)
+    tok = proc.tokenizer
+    tower, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16)
+    fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True)
+
+    model = FusionEmbeddingModel(cfg, full.get_input_embeddings(),
+                                 BaseLMAdapter(full.language_model), audio_encoder=tower)
+    model.resampler.to(dev).float()
+    model.resampler.load_state_dict(ckpt["resampler"])
+    model.text_whitening.load_state_dict(ckpt["text_whitening"])
+    model.eval()
+    whiten = model.text_whitening
+    eos_str = tok.decode([cfg.eos_id])
+    geometry = geometry.lower()
+    if geometry not in ("raw", "whitened", "centered"):
+        raise ValueError(f"geometry must be raw|whitened|centered, got {geometry!r}")
+    # Image template: the official Qwen3-VL-Embedding protocol (native) or the minimal span.
+    if use_native_templates:
+        image_template = ("<|im_start|>system\nRepresent the user's input.<|im_end|>\n"
+                          "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+                          "<|im_end|>\n<|im_start|>assistant\n")
+    else:
+        image_template = f"<|vision_start|><|image_pad|><|vision_end|>{eos_str}"
+
+    import av as _av
+    from datasets import Audio as DAudio, Video as DVideo, load_dataset
+    ds = load_dataset(dataset, split="test", streaming=True)
+    ds = ds.cast_column("audio", DAudio(decode=False)).cast_column("video", DVideo(decode=False))
+
+    def _mid_frame(mp4_bytes):
+        with _av.open(io.BytesIO(mp4_bytes)) as c:
+            last = None
+            for i, fr in enumerate(c.decode(video=0)):
+                last = fr
+                if i == frame_index:
+                    break
+            return last.to_image() if last is not None else None
+
+    mels, images, captions = [], [], []
+    n_bad = 0
+    for i, row in enumerate(ds):
+        if limit and len(mels) >= limit:
+            break
+        try:
+            wav, sr0 = sf.read(io.BytesIO(row["audio"]["bytes"]), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sr0 != fe.sampling_rate:
+                import librosa
+                wav = librosa.resample(wav, orig_sr=sr0, target_sr=fe.sampling_rate)
+            feats = fe(wav, sampling_rate=fe.sampling_rate, return_tensors="pt",
+                       return_attention_mask=True, padding="max_length", truncation=True)
+            mel = feats["input_features"][0]
+            am = feats.get("attention_mask")
+            if am is not None:
+                mel = mel[:, : int(am[0].sum().item())]
+            img = _mid_frame(row["video"]["bytes"])
+            if img is None:
+                n_bad += 1
+                continue
+            mels.append(mel)
+            images.append(img.convert("RGB"))
+            captions.append(str(row.get(caption_field) or row.get("audio_caption")
+                                or row.get("video_caption") or ""))
+        except Exception as e:                                     # noqa: BLE001
+            n_bad += 1
+            if n_bad <= 3:
+                print(f"decode fail row {i}: {type(e).__name__}: {e}")
+    n = len(mels)
+    print(f"decoded {n} pairs ({n_bad} failed)")
+
+    @torch.no_grad()
+    def embed_audio():
+        out = []
+        ids_row = [cfg.audio_pad_id] * cfg.n_query + [cfg.eos_id]
+        for s in range(0, n, batch_audio):
+            batch = mels[s: s + batch_audio]
+            L = max(m.shape[1] for m in batch)
+            mel = torch.zeros(len(batch), batch[0].shape[0], L)
+            mm = torch.zeros(len(batch), L, dtype=torch.bool)
+            for b, m in enumerate(batch):
+                mel[b, :, : m.shape[1]] = m
+                mm[b, : m.shape[1]] = True
+            audio_tok = model.audio_tokens(mel.to(dev), mm.to(dev))
+            ids = torch.tensor([ids_row] * len(batch), device=dev)
+            pooled = model.encode_audio(ids, torch.ones_like(ids), audio_tok)
+            out.append(pooled.float().cpu())
+        return torch.cat(out)
+
+    @torch.no_grad()
+    def embed_images():
+        out = []
+        for img in images:
+            inputs = proc(text=[image_template], images=[img], return_tensors="pt").to(dev)
+            h = full(**inputs).last_hidden_state
+            out.append(last_token_pool(h, inputs["attention_mask"]).float().cpu())
+        return torch.cat(out)
+
+    a = embed_audio()                                              # trained (whitened) space
+    im_raw = embed_images()                                        # RAW base space
+    # Apply the requested geometry to BOTH sides consistently, then MRL-normalize.
+    if geometry == "raw":
+        ax, imx = a, im_raw
+    elif geometry == "whitened":
+        ax, imx = a, whiten(im_raw)
+    else:                                                          # centered (the card default)
+        ax, imx = a - a.mean(0), im_raw - im_raw.mean(0)
+    an = mrl_truncate_normalize(ax, cfg.mrl_default)
+    imn = mrl_truncate_normalize(imx, cfg.mrl_default)
+    print(f"embedded: audio {tuple(a.shape)} image {tuple(im_raw.shape)} | geometry={geometry} "
+          f"| native_templates={use_native_templates}")
+
+    # Aggregate sanity — must reproduce the card's audio->image number for this geometry.
+    agg = {kk: round(float(vv), 4) for kk, vv in retrieval_report(an, imn).items()}
+    sim = an @ imn.t()                                             # [Nq_audio, Nimg]
+    rows = select_gallery(sim, k=k)                                # ranking for ALL queries
+
+    def _thumb(idx):
+        im = images[idx].copy()
+        im.thumbnail((thumb_px, thumb_px))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=82)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    keep = min(n_queries, n)
+    queries = []
+    for r in rows[:keep]:
+        qi = r["query"]
+        queries.append({
+            "query": qi,
+            "caption": captions[qi],
+            "true_idx": r["true_idx"],
+            "true_rank": r["true_rank"],
+            "hit_at_k": r["hit_at_k"],
+            "true_thumb": _thumb(r["true_idx"]),
+            "topk": [{"idx": j, "is_true": j == r["true_idx"], "caption": captions[j],
+                      "thumb": _thumb(j)} for j in r["topk"]],
+        })
+    compact = [{"query": r["query"], "true_rank": r["true_rank"], "hit_at_k": r["hit_at_k"],
+                "topk": r["topk"]} for r in rows]
+
+    out = {"dataset": dataset, "n_pairs": n, "decode_failed": n_bad, "ckpt": run_tag,
+           "geometry": geometry, "native_templates": use_native_templates,
+           "k": k, "n_thumbs": keep,
+           "chance_R@10": round(10.0 / max(n, 1), 4),
+           "aggregate_audio_to_image": agg, "queries": queries, "ranking_all": compact}
+    name = f"gallery_a2i{run_tag}{('_' + out_tag) if out_tag else ''}.json"
+    with open(str(checkpoints_dir() / name), "w") as fh:
+        json.dump(out, fh)
+    volume.commit()
+    hits = sum(1 for r in rows if r["hit_at_k"])
+    print(f"GALLERY: wrote {name} | aggregate a2t_R@10={agg.get('a2t_R@10')} "
+          f"| top{k} hit-rate {hits}/{len(rows)} | {keep} thumbnailed queries")
+    return {"file": name, "aggregate_audio_to_image": agg, "n_pairs": n,
+            "top_k_hits": hits, "n_thumbs": keep}
+
+
+@app.function(gpu="L4", secrets=[hf_secret], volumes={VOL: volume}, cpu=8.0, memory=65536,
+              timeout=4 * 3600, env=HF_ENV)
 def probe_tower_layers(dataset: str = "ashraq/esc50", limit: int = 0,
                        probe_epochs: int = 300, out_tag: str = "esc50") -> dict:
     """PHASE A1 — does the Whisper-AT layer effect replicate on OUR Omni tower?
