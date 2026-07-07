@@ -272,7 +272,7 @@ on audio–text only — its audio↔image alignment is emergent):
 |---|---|---|---|
 | ImageBind-Huge | **0.718 / 0.720** | 0.404 / 0.348 | 0.243 / 0.282 |
 | fusion-embedding-1-2b-preview v0.1 | 0.368 / 0.388 | 0.555 / 0.592 | 0.331 / 0.319 |
-| **fusion-embedding-1-2b-preview v0.2** | **0.418 / 0.440** | **0.588 / 0.631** | **0.331 / 0.319** |
+| **fusion-embedding-1-2b-preview v0.2** | 0.418 / 0.440 | **0.588 / 0.631** | **0.331 / 0.319** |
 
 Full v0.2 audio→image metrics (per-modality mean-centered readout): R@1 0.088, R@5 0.315,
 R@10 0.418 (29× chance), mAP@10 0.179 — with zero audio–image training pairs. What that
