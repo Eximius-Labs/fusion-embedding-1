@@ -2320,13 +2320,13 @@ def train_frames(frame_shard: str = "audiocaps4k_post_proj", steps: int = 2000,
                  d_resampler: int = 256, n_query: int = 64,
                  fn_mask_threshold: float = 0.0, soft_label_beta: float = 0.0,
                  text_cache_tag: str = "", num_workers: int = 4,
-                 train_max_frames: int = 250) -> dict:
+                 train_max_frames: int = 250, init_from_ckpt: str = "") -> dict:
     """L4 wrapper — see _train_frames_impl."""
     return _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                               load_in_4bit, gpu_note, whiten_text, run_tag, eval_816_shard,
                               use_text_cache, accum_steps, bank_negatives, peak_lr,
                               d_resampler, n_query, fn_mask_threshold, soft_label_beta,
-                              text_cache_tag, num_workers, train_max_frames)
+                              text_cache_tag, num_workers, train_max_frames, init_from_ckpt)
 
 
 @app.function(gpu="H100", volumes={VOL: volume}, secrets=[hf_secret], timeout=16 * 3600,
@@ -2344,13 +2344,13 @@ def train_frames_a100(frame_shard: str = "audiocaps4k_post_proj", steps: int = 4
                       d_resampler: int = 256, n_query: int = 64,
                       fn_mask_threshold: float = 0.0, soft_label_beta: float = 0.0,
                       text_cache_tag: str = "", num_workers: int = 4,
-                      train_max_frames: int = 250) -> dict:
+                      train_max_frames: int = 250, init_from_ckpt: str = "") -> dict:
     """A100-80GB wrapper — bigger batch (more negatives) + more RAM for larger frame sets."""
     return _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                               load_in_4bit, gpu_note, whiten_text, run_tag, eval_816_shard,
                               use_text_cache, accum_steps, bank_negatives, peak_lr,
                               d_resampler, n_query, fn_mask_threshold, soft_label_beta,
-                              text_cache_tag, num_workers, train_max_frames)
+                              text_cache_tag, num_workers, train_max_frames, init_from_ckpt)
 
 
 # --------------------------------------------------------------------------- #
@@ -3547,7 +3547,7 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                        accum_steps=1, bank_negatives=False, peak_lr=0.0,
                        d_resampler=256, n_query=64, fn_mask_threshold=0.0,
                        soft_label_beta=0.0, text_cache_tag="", num_workers=4,
-                       train_max_frames=250) -> dict:
+                       train_max_frames=250, init_from_ckpt="") -> dict:
     import glob
     import itertools
     import json
@@ -3694,6 +3694,19 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
             wstats = fit_text_whitening(model, train_ds, collator, device=dev, max_samples=4096)
         print(f"text whitening fitted: {wstats}")
 
+    # Second-stage fine-tune entry: warm-start trainables from a FINISHED ckpt. Placed AFTER the
+    # whitening fit (the ckpt's whitening overwrites it — the connector was trained against that
+    # exact transform) and BEFORE the bank build (bank must whiten with the transform we keep).
+    if init_from_ckpt:
+        from fusion_embedding.train_stage1 import init_trainables_from_ckpt
+        ick = torch.load(str(checkpoints_dir() / init_from_ckpt), map_location="cpu",
+                         weights_only=False)
+        if bool(ick.get("base_4bit", False)) != bool(load_in_4bit):
+            print(f"WARNING: init ckpt base_4bit={ick.get('base_4bit')} but this run "
+                  f"load_in_4bit={load_in_4bit} — precision mismatch costs points (−5.6 incident)")
+        init_info = init_trainables_from_ckpt(model, ick)
+        print(f"INIT_FROM_CKPT {init_from_ckpt}: {init_info}")
+
     # Step 3: full-corpus frozen-text negative bank (A→T denominator). Zero staleness — text is
     # frozen and cached; whitened once (fixed diagonal after fit). Eval clips excluded so eval
     # captions are never training negatives; each anchor's own caption is masked per batch.
@@ -3721,7 +3734,7 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
     resume_key = (f"{frame_shard}|d{cfg.d_resampler}|N{cfg.n_query}|b{batch_size}x{accum_steps}"
                   f"|lr{peak_lr or cfg.lr}|bank{int(bank_negatives)}|4bit{int(load_in_4bit)}"
                   f"|wh{int(whiten_text)}|fn{cfg.fn_mask_threshold}|sl{cfg.soft_label_beta}"
-                  f"|tc{text_cache_tag}")
+                  f"|tc{text_cache_tag}|init{init_from_ckpt}")
     start_step = load_resume_ckpt(resume_path, model, opt, sched, total_steps=steps,
                                   config_key=resume_key)
     print(f"RESUME: continuing from step {start_step}/{steps}" if start_step > 0

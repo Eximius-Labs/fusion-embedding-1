@@ -111,6 +111,37 @@ def load_resume_ckpt(path: str, model: FusionEmbeddingModel, opt, sched, *, tota
     return int(ck["step"]) + 1
 
 
+def init_trainables_from_ckpt(model: FusionEmbeddingModel, ck: dict) -> dict:
+    """Warm-start the TRAINABLE state from a FINISHED training checkpoint (the dict written by
+    the trainer: ``resampler`` + ``text_whitening`` + ``logit_scale`` + ``config``) — the
+    second-stage fine-tune entry point.
+
+    Unlike ``load_resume_ckpt`` this deliberately does NOT restore optimizer/scheduler state:
+    a fine-tune is a NEW optimization (fresh schedule, usually a lower lr), not a continuation
+    of the same run. The pretrain's whitening buffers ARE restored — the audio side was trained
+    against that exact transform, so refitting whitening on the FT corpus would shift the
+    target space out from under the connector. Raises on architecture mismatch."""
+    cfg_ck = ck.get("config", {}) or {}
+    for key in ("d_resampler", "n_query"):
+        want = getattr(model.cfg, key, None)
+        have = cfg_ck.get(key)
+        if have is not None and want is not None and int(have) != int(want):
+            raise ValueError(f"init_from_ckpt architecture mismatch: ckpt {key}={have} "
+                             f"but model has {key}={want}")
+    model.resampler.load_state_dict(ck["resampler"])
+    loaded = ["resampler"]
+    if "text_whitening" in ck:
+        model.text_whitening.load_state_dict(ck["text_whitening"])
+        loaded.append("text_whitening")
+    if ck.get("logit_scale") is not None:
+        with torch.no_grad():
+            model.logit_scale.copy_(torch.as_tensor(ck["logit_scale"]).float()
+                                    .reshape(()).to(model.logit_scale.device))
+        loaded.append("logit_scale")
+    return {"loaded": loaded, "ckpt_d_resampler": cfg_ck.get("d_resampler"),
+            "ckpt_base_4bit": ck.get("base_4bit")}
+
+
 # ---------------------------------------------------------------------------- #
 # Regression guard — the base must not move (HLD §7 invariant)
 # ---------------------------------------------------------------------------- #
