@@ -122,24 +122,14 @@ are unaffected by this extension.
 
 ## Architecture
 
-```
-                          ┌────────── Qwen3-VL-Embedding-2B (frozen) ────────┐
-text / image / video ───▶ │  native encoding paths, unmodified               │
-                          │                                                  │
-audio ─▶ Qwen2.5-Omni     │                                                  │
-         audio tower      │                                                  │
-         (frozen)         │                                                  │
-   └─▶ FusionResampler ───┼─▶ audio tokens in the input stream ─▶ LLM ─▶     │
-        (trained, ~16M)   │                       last-token pooled embedding│
-                          └──────────────────────────────────────────────────┘
-```
+![Fusion Embedding architecture: frozen Qwen3-VL-Embedding-2B base and frozen Qwen2.5-Omni audio tower; only the FusionResampler is trained](assets/architecture.png)
 
 A perceiver-resampler (width 384, 64 latent queries) translates frozen audio-tower frames
 into the base model's input embedding space; its outputs occupy placeholder positions in
 the input stream, mirroring the base model's image-token mechanism. Training is
-contrastive (InfoNCE over the Matryoshka ladder, symmetric, with a 131K-caption
-full-corpus negative bank) against the base model's text embeddings in its native
-input format.
+contrastive (InfoNCE over the Matryoshka ladder, symmetric, with a full-corpus
+frozen-text negative bank — 484K captions at v0.2) against the base model's text
+embeddings in its native input format.
 
 **Input formatting.** All inputs use the base model's chat-template format (instruction in
 the system turn, content in the user turn, last-token pooling). Embedding quality is

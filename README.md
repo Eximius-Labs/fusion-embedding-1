@@ -95,25 +95,12 @@ an ImageBind comparison).
 
 ## Architecture
 
-```
-                          ┌───────────────── FROZEN base (Qwen3-VL-Embedding) ─────────────────┐
-text / image / video ───▶ │  (the base's own paths — untouched, byte-identical to the release) │
-                          │                                                                    │
-audio ─▶ [Qwen2.5-Omni    │                                                                    │
-         audio encoder]   │                                                                    │
-         (FROZEN)         │                                                                    │
-         frames [B,T,3584]│                                                                    │
-   └─▶ [FusionResampler] ─┼─▶ audio tokens [B,N,2048] ─▶ spliced at <|audio_pad|> positions ──▶│
-        (TRAINED, ~16M)   │      ─▶ frozen LLM ─▶ EOS-token hidden state [B, 2048]             │
-                          └───────────────────────────────────────────────────┬───────────────┘
-                                                                              ▼
-                                       MRL-truncate (any ladder rung) ─▶ L2-normalize ─▶ embedding
-```
+![Fusion Embedding architecture: frozen Qwen3-VL-Embedding base and frozen Qwen2.5-Omni audio tower; only the FusionResampler is trained](assets/architecture.png)
 
 The **FusionResampler** is a Flamingo-style perceiver resampler running at a
 384-d bottleneck: `in_proj 3584→384` → N=64 learnable latent queries through
 L=6 pre-norm blocks (self-attention → cross-attention over audio frames → FFN)
-→ `out_proj 384→2048`. Its N output tokens overwrite `<|audio_pad|>` placeholder
+→ `out_proj 384→2048`. Its N output tokens overwrite `<|vision_pad|>` placeholder
 positions in the frozen LLM's input-embedding stream — the exact mirror of the
 base's image-token mechanism. EOS pooling and the MRL ladder are the base's own;
 **audio conforms to the base, never the reverse.**
