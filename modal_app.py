@@ -1179,6 +1179,140 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
     return result
 
 
+@app.function(volumes={VOL: volume}, cpu=4.0, memory=32768, timeout=1800, env=HF_ENV)
+def verify_shard_alignment(frame_shard: str = "laion_freesound_full", n_check: int = 12) -> dict:
+    """Check that the first ``n_check`` shard files still match index.json caption positions.
+
+    Used after an accidental partial re-ingest overwrote early shard files: if every record's
+    caption equals the index caption at its global position, frames/captions/text-cache stay
+    consistent (frames are recomputed features of the SAME clip). CPU-only, read-only."""
+    import json
+
+    import torch
+
+    from fusion_embedding.paths import frames_dir
+
+    d = frames_dir(frame_shard)
+    with open(str(d / "index.json")) as fh:
+        ix = json.load(fh)
+    caps = ix["captions"]
+    bad = []
+    start = 0                                                    # cumulative — shard sizes VARY
+    for p in range(min(n_check, len(ix["shards"]))):
+        sh = torch.load(str(d / ix["shards"][p]), map_location="cpu", weights_only=False)
+        want = caps[start: start + len(sh["text"])]
+        mism = [i for i, (a, b) in enumerate(zip(sh["text"], want)) if a != b]
+        print(f"shard {p:04d}: {len(sh['text'])} recs @ start {start} | {len(mism)} caption "
+              f"mismatches" + (f" (first at {mism[0]})" if mism else ""))
+        if mism:
+            bad.append({"shard": p, "n_records": len(sh["text"]), "n_mismatch": len(mism)})
+        start += len(sh["text"])
+    out = {"frame_shard": frame_shard, "checked": min(n_check, len(ix["shards"])),
+           "verdict": "ALIGNED" if not bad else "CORRUPTED", "bad": bad}
+    print("VERIFY_SHARD_ALIGNMENT:", out)
+    return out
+
+
+@app.function(volumes={VOL: volume}, cpu=4.0, memory=32768, timeout=3600, env=HF_ENV)
+def rebuild_source_index(frame_shard: str = "laion_freesound_full", n_rewritten: int = 12,
+                         cache_tag: str = "_native", dry_run: bool = True) -> dict:
+    """Repair a source whose first ``n_rewritten`` shard files were overwritten by a partial
+    re-ingest: rebuild index.json's flat captions/tasks from the shard files (source of truth)
+    and delete the now-stale ``.txtemb`` caches for those shards (re-run precompute_text_cache
+    afterwards — it skips shards whose cache exists, so it rebuilds exactly the deleted ones).
+
+    Reads only ``n_rewritten + 1`` shard files: the rewritten ones supply the new head; the
+    first UNCHANGED shard's opening captions are located as a window in the old flat list to
+    find where the old tail begins. Aborts if the window match is not unique."""
+    import json
+    import os
+
+    import torch
+
+    from fusion_embedding.data import text_emb_shard_path
+    from fusion_embedding.paths import frames_dir
+
+    d = frames_dir(frame_shard)
+    with open(str(d / "index.json")) as fh:
+        ix = json.load(fh)
+    old_caps, old_tasks = ix["captions"], ix["tasks"]
+
+    new_caps: list = []; new_tasks: list = []
+    for p in range(n_rewritten):
+        sh = torch.load(str(d / ix["shards"][p]), map_location="cpu", weights_only=False)
+        new_caps += [str(t) for t in sh["text"]]; new_tasks += list(sh["task"])
+    anchor_sh = torch.load(str(d / ix["shards"][n_rewritten]), map_location="cpu",
+                           weights_only=False)
+    win = [str(t) for t in anchor_sh["text"][:5]]
+    hits = [i for i in range(len(old_caps) - len(win) + 1) if old_caps[i:i + len(win)] == win]
+    if len(hits) != 1:
+        return {"error": f"anchor window matched {len(hits)} times in old captions — "
+                         "cannot splice safely; fall back to reading ALL shards"}
+    old_tail_start = hits[0]
+    caps = new_caps + old_caps[old_tail_start:]
+    tasks = new_tasks + old_tasks[old_tail_start:]
+    stale = [text_emb_shard_path(str(d / ix["shards"][p]), cache_tag) for p in range(n_rewritten)]
+    stale = [p for p in stale if os.path.exists(p)]
+    result = {"frame_shard": frame_shard, "old_n_total": ix.get("n_total", len(old_caps)),
+              "new_n_total": len(caps), "head_records": len(new_caps),
+              "old_tail_start": old_tail_start, "stale_caches_to_delete": len(stale),
+              "dry_run": dry_run}
+    if not dry_run:
+        ix["captions"], ix["tasks"], ix["n_total"] = caps, tasks, len(caps)
+        tmp = str(d / "index.json") + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(ix, fh)
+        os.replace(tmp, str(d / "index.json"))
+        for p in stale:
+            os.remove(p)
+        volume.commit()
+    print("REBUILD_SOURCE_INDEX:", result)
+    return result
+
+
+@app.function(volumes={VOL: volume}, secrets=[hf_secret], cpu=2.0, memory=8192, timeout=1800,
+              env=HF_ENV)
+def seed_ingest_skiplist(repo: str = "Meranti/CLAP_freesound",
+                         prefixes: str = "freesound/train_1,freesound/train_2",
+                         frame_shard: str = "laion_freesound_tail",
+                         n_skip: int = 700, dry_run: bool = True) -> dict:
+    """Pre-seed a FRESH shard dir's ``_ingest_progress.json`` marking the first ``n_skip``
+    tars (sorted exactly as ``ingest_webdataset_frames`` sorts) as completed, so a subsequent
+    ingest processes ONLY the tail into its own source. This is the sanctioned way to extend
+    a tar corpus whose original dir is finalized (appending there would break position
+    bookkeeping after its partial last shard). Refuses to touch an existing shard dir."""
+    import json
+    import os
+
+    from huggingface_hub import HfApi
+
+    from fusion_embedding.paths import frames_dir
+
+    token = os.environ.get("HF_TOKEN") or None
+    pfx = [p.strip() for p in prefixes.split(",") if p.strip()]
+    files = HfApi().list_repo_files(repo, repo_type="dataset", token=token)
+    tars = sorted([f for f in files if f.endswith(".tar") and any(f.startswith(p + "/") for p in pfx)],
+                  key=lambda f: (f.rsplit("/", 1)[0], int(f.rsplit("/", 1)[1][:-4])))
+    if n_skip >= len(tars):
+        return {"error": f"n_skip={n_skip} >= {len(tars)} tars — nothing to process"}
+    skip = tars[:n_skip]
+    out_dir = frames_dir(frame_shard)
+    prog_path = out_dir / "_ingest_progress.json"
+    if os.path.exists(str(out_dir / "index.json")) or os.path.exists(str(prog_path)):
+        return {"error": f"'{frame_shard}' already exists — refusing to seed over it"}
+    result = {"frame_shard": frame_shard, "total_tars": len(tars), "skipped": len(skip),
+              "to_process": len(tars) - len(skip), "first_skipped": skip[0],
+              "last_skipped": skip[-1], "first_to_process": tars[n_skip], "dry_run": dry_run}
+    if not dry_run:
+        os.makedirs(str(out_dir), exist_ok=True)
+        with open(str(prog_path), "w") as fh:
+            json.dump({"completed_tars": skip, "n_kept": 0, "n_bl": 0, "n_bad": 0,
+                       "shards": [], "captions": [], "tasks": []}, fh)
+        volume.commit()
+    print("SEED_INGEST_SKIPLIST:", result)
+    return result
+
+
 @app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=24 * 3600,
               memory=32768, cpu=4.0, env=HF_ENV,
               retries=modal.Retries(max_retries=3, initial_delay=10.0, backoff_coefficient=1.0))
@@ -1187,7 +1321,8 @@ def ingest_webdataset_frames(repo: str = "Meranti/CLAP_freesound",
                              frame_shard: str = "laion_freesound_full",
                              audio_feature_layer: str = "post_proj", shard_size: int = 512,
                              limit_tars: int = 0, batch: int = 16,
-                             apply_blacklist: bool = True, finalize: bool = True) -> dict:
+                             apply_blacklist: bool = True, finalize: bool = True,
+                             allow_restart: bool = False) -> dict:
     """FUSED ingestion for WebDataset tar mirrors (LAION-Freesound): stream each tar ->
     pair {id}.flac/{id}.json -> caption from json['text'] -> blacklist (WavCaps lists carry
     the Freesound ids of Clotho/ESC-50/UrbanSound8K) -> mel -> frozen tower -> sharded frames.
@@ -1248,6 +1383,14 @@ def ingest_webdataset_frames(repo: str = "Meranti/CLAP_freesound",
             prog = json.load(fh)
         print(f"RESUME: {len(prog['completed_tars'])} tars done "
               f"({prog['n_kept']} kept, {len(prog['shards'])} shards)")
+    elif os.path.exists(str(out_dir / "index.json")) and not allow_restart:
+        # A clean finish deletes the resume state, so no-progress + index.json means a
+        # FINISHED ingest lives here; starting fresh would overwrite its shards from tar 0
+        # (this exact incident cost a partial re-ingest on 2026-07-07). Ingest a tail into
+        # a NEW frame_shard via seed_ingest_skiplist instead.
+        raise RuntimeError(f"'{frame_shard}' already holds a finalized ingest (index.json present, "
+                           "no resume state). Refusing to restart from tar 0. Use a new "
+                           "frame_shard + seed_ingest_skiplist, or pass allow_restart=True.")
 
     def _save_progress():
         tmp = str(progress_path) + ".tmp"
