@@ -111,6 +111,33 @@ def load_resume_ckpt(path: str, model: FusionEmbeddingModel, opt, sched, *, tota
     return int(ck["step"]) + 1
 
 
+def qb_norm(sim_qg: torch.Tensor, bank_sim_bg: torch.Tensor, beta: float = 20.0,
+            mode: str = "dis") -> torch.Tensor:
+    """Querybank Normalisation (Bogolin et al., CVPR 2022) — test-time hubness correction.
+
+    ``sim_qg`` [Q, G]: test query→gallery similarities. ``bank_sim_bg`` [B, G]: querybank
+    (TRAINING-set queries, never test) → gallery similarities. Inverted softmax divides each
+    gallery item's score by how strongly the bank as a whole is attracted to it, deflating
+    hub items. ``mode='dis'`` (Dynamic Inverted Softmax, the paper's robust variant) applies
+    the correction ONLY to test queries whose raw top-1 lands on a bank-activated item
+    (an item that is top-1 for ≥1 bank query); other queries keep raw scores. Returns
+    adjusted similarities — ranks derived from them, values not comparable to raw."""
+    if sim_qg.dim() != 2 or bank_sim_bg.dim() != 2 or sim_qg.shape[1] != bank_sim_bg.shape[1]:
+        raise ValueError(f"shape mismatch: sim {tuple(sim_qg.shape)} bank {tuple(bank_sim_bg.shape)}")
+    denom = torch.exp(beta * bank_sim_bg).sum(dim=0)            # [G] bank attraction per item
+    adjusted = torch.exp(beta * sim_qg) / denom.unsqueeze(0)    # inverted softmax
+    if mode == "is":
+        return adjusted
+    if mode != "dis":
+        raise ValueError(f"unknown mode {mode!r} (use 'is' or 'dis')")
+    activated = torch.zeros(sim_qg.shape[1], dtype=torch.bool)
+    activated[bank_sim_bg.argmax(dim=1)] = True                 # bank-activated gallery items
+    hub_hit = activated[sim_qg.argmax(dim=1)]                   # [Q] raw top-1 is a hub?
+    out = sim_qg.clone()
+    out[hub_hit] = adjusted[hub_hit]
+    return out
+
+
 def init_trainables_from_ckpt(model: FusionEmbeddingModel, ck: dict) -> dict:
     """Warm-start the TRAINABLE state from a FINISHED training checkpoint (the dict written by
     the trainer: ``resampler`` + ``text_whitening`` + ``logit_scale`` + ``config``) — the

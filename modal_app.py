@@ -2758,6 +2758,134 @@ def uiq_eval(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocaps_trai
     return out
 
 
+@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=2 * 3600,
+              memory=32768, env=HF_ENV)
+def rescore_qbnorm(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocaps_train_full",
+                   steps: int = 400, run_tag: str = "_v02_acft_400", load_in_4bit: bool = False,
+                   task: str = "sound", dim: int = 0,
+                   qb_shards: str = "audiocaps_train_full,laion_freesound_full",
+                   qb_per_shard: int = 12, betas: str = "5,10,20,40",
+                   out_tag: str = "qb") -> dict:
+    """T2A rescore with QB-Norm/DIS test-time hubness correction (Bogolin et al., CVPR
+    2022) alongside the plain baseline. Querybank = cached TRAINING captions (never test):
+    the first ``qb_per_shard`` txtemb shards from each source in ``qb_shards``, whitened +
+    MRL-normalized exactly like eval queries. Sweeps ``betas`` (comma list) — select beta
+    on AudioCaps, then apply the FROZEN beta to Clotho (disclosed dev/test separation).
+    T2A protocol matches rescore_816's: every reference caption is a query, its clip is
+    the single target. Read-only except one result JSON."""
+    import dataclasses
+    import json
+
+    import torch
+
+    from fusion_embedding.config import FusionConfig
+    from fusion_embedding.data import (FrameCollator, InMemoryFrameDataset, instruction_for,
+                                       load_frame_clips, shard_starts_from, text_emb_shard_path)
+    from fusion_embedding.hf_components import load_base
+    from fusion_embedding.model import FusionEmbeddingModel, mrl_truncate_normalize
+    from fusion_embedding.paths import checkpoints_dir, frames_dir
+    from fusion_embedding.train_stage1 import (encode_dataset, flatten_caption_groups, qb_norm)
+
+    dev = "cuda"
+    fdir = frames_dir(eval_shard)
+    with open(str(fdir / "index.json")) as fh:
+        index = json.load(fh)
+    caps_multi = index["captions_multi"]
+    d_audio = int(index["d_audio"])
+
+    ckpt_path = str(checkpoints_dir() / f"p1frames_{ckpt_shard}_step{steps}{run_tag}.pt")
+    ckpt = torch.load(ckpt_path, map_location=dev)
+    flds = {f.name for f in dataclasses.fields(FusionConfig)}
+    saved = {k: v for k, v in ckpt.get("config", {}).items() if k in flds}
+    cfg0 = FusionConfig(**{**saved, "d_audio": d_audio})
+    if "base_4bit" in ckpt and bool(ckpt["base_4bit"]) != bool(load_in_4bit):
+        print(f"WARNING: ckpt base_4bit={ckpt['base_4bit']} vs load_in_4bit={load_in_4bit}")
+    cfg, embed_tokens, base_lm, tokenizer = load_base(
+        cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit, d_audio=d_audio)
+    model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder=None)
+    model.resampler.to(dev).float()
+    model.resampler.load_state_dict(ckpt["resampler"])
+    if isinstance(model.logit_scale, torch.nn.Parameter):
+        model.logit_scale.data = ckpt["logit_scale"].to(dev)
+    if "text_whitening" in ckpt:
+        model.text_whitening.load_state_dict(ckpt["text_whitening"])
+    collator = FrameCollator(cfg, _HFTok(tokenizer, cfg))
+    dim = int(dim) or cfg.mrl_default
+
+    # Eval audio pool + all reference captions (t2a queries) — native protocol.
+    shard_paths = [str(fdir / s) for s in index["shards"]]
+    starts = shard_starts_from(len(shard_paths), int(index["shard_size"]), index["n_total"])
+    eval_ds = InMemoryFrameDataset(load_frame_clips(shard_paths, starts,
+                                                    list(range(len(caps_multi)))))
+    audio_emb, _ = encode_dataset(model, eval_ds, collator, dim=dim, device=dev)
+    flat_caps, group_ids = flatten_caption_groups(caps_multi)
+    instr = instruction_for(task)
+    hf_tok = getattr(collator.tokenizer, "hf", collator.tokenizer)
+    model.eval()
+
+    def _encode_texts(texts):
+        chunks, bs = [], 64
+        with torch.no_grad():
+            for i in range(0, len(texts), bs):
+                bodies = [f"<|im_start|>system\n{instr}<|im_end|>\n"
+                          f"<|im_start|>user\n{c}<|im_end|>\n"
+                          f"<|im_start|>assistant\n" for c in texts[i:i + bs]]
+                seqs = [hf_tok.encode(b, add_special_tokens=False)[:254] for b in bodies]
+                L = max(len(q) for q in seqs)
+                ids = torch.full((len(seqs), L), cfg.pad_id, dtype=torch.long)
+                mask = torch.zeros(len(seqs), L, dtype=torch.long)
+                for b, q in enumerate(seqs):
+                    ids[b, : len(q)] = torch.tensor(q)
+                    mask[b, : len(q)] = 1
+                raw = model.encode_text(ids.to(dev), mask.to(dev))
+                chunks.append(mrl_truncate_normalize(model.text_whitening(raw), dim).cpu())
+        return torch.cat(chunks)
+
+    text_emb = _encode_texts(flat_caps)                          # [n_caps, dim]
+
+    # Querybank: cached RAW training-caption embeddings -> ckpt whitening -> MRL norm.
+    bank_chunks = []
+    for src in [s.strip() for s in qb_shards.split(",") if s.strip()]:
+        sdir = frames_dir(src)
+        with open(str(sdir / "index.json")) as fh:
+            six = json.load(fh)
+        for sh in six["shards"][:qb_per_shard]:
+            tp = text_emb_shard_path(str(sdir / sh), "_native")
+            raw = torch.load(tp, map_location="cpu", weights_only=False)["text_emb"].float()
+            with torch.no_grad():
+                w = model.text_whitening(raw.to(dev)).cpu()
+            bank_chunks.append(mrl_truncate_normalize(w, dim))
+    bank_emb = torch.cat(bank_chunks)
+    print(f"querybank: {bank_emb.shape[0]} training captions from [{qb_shards}]")
+
+    # Similarities in float32: qb_norm exponentiates (beta up to ~40) — bf16 loses rank fidelity.
+    sim = (text_emb.to(audio_emb.dtype) @ audio_emb.t()).float()          # [n_caps, n_clips]
+    bank_sim = (bank_emb.to(audio_emb.dtype) @ audio_emb.t()).float()     # [n_bank, n_clips]
+    true_idx = torch.tensor(group_ids)
+
+    def _t2a_report(s):
+        ts = s.gather(1, true_idx.unsqueeze(1))
+        ranks = (s > ts).sum(dim=1) + 1
+        rep = {f"t2a_R@{k}": round(float((ranks <= k).float().mean()), 4) for k in (1, 5, 10)}
+        rep["t2a_medR"] = float(ranks.median())
+        return rep
+
+    results = {"plain": _t2a_report(sim)}
+    for b in [float(x) for x in betas.split(",") if x.strip()]:
+        results[f"dis_beta{b:g}"] = _t2a_report(qb_norm(sim, bank_sim, beta=b, mode="dis"))
+        print(f"beta {b:g}: {results[f'dis_beta{b:g}']} | plain: {results['plain']}")
+
+    out = {"eval_shard": eval_shard, "ckpt": ckpt_path, "dim": dim, "n_bank": bank_emb.shape[0],
+           "protocol": "t2a single-positive per reference caption; QB-Norm DIS (CVPR 2022), "
+                       "querybank = training captions only", "results": results}
+    name = f"qbnorm{run_tag}_{eval_shard}_{out_tag}.json"
+    with open(str(checkpoints_dir() / name), "w") as fh:
+        json.dump(out, fh, indent=2)
+    volume.commit()
+    print("RESCORE_QBNORM:", json.dumps(results))
+    return out
+
+
 @app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=3 * 3600,
               memory=32768, env=HF_ENV)
 def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audiocaps10k_post_proj",
