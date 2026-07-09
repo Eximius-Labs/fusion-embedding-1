@@ -79,14 +79,23 @@ R@10 shown as audio-side → other / other → audio-side:
 | Model | audio↔image | audio↔text | text↔image |
 |---|---|---|---|
 | ImageBind-Huge | **0.718 / 0.720** | 0.404 / 0.348 | 0.243 / 0.282 |
+| LanguageBind | 0.365 / 0.415 | 0.547 / 0.331 | 0.221 / 0.283 |
 | fusion-embedding-1-2b-preview v0.1 | 0.368 / 0.388 | 0.555 / 0.592 | 0.331 / 0.319 |
 | fusion-embedding-1-2b-preview v0.2 | 0.418 / 0.440 | 0.588 / 0.631 | 0.331 / 0.319 |
 | **fusion-embedding-1-2b-preview v0.3** | 0.407 / 0.428 | **0.625 / 0.645** | **0.331 / 0.319** |
 
 *ImageBind trains directly on audio–image pairs, so that pair is its supervised direction;
-its audio–text alignment is emergent. This model trains on audio–text only; its
-audio–image alignment is emergent. Both evaluated with identical clips, frames, and
-scoring; ImageBind numbers computed with the released imagebind_huge checkpoint.*
+its audio–text alignment is emergent. LanguageBind trains audio against language (its
+audio↔text is supervised; the value shown is its best readout, using the audio branch's
+own text tower); its audio↔image is emergent. This model trains on audio–text only; its
+audio–image alignment is emergent. All models evaluated with identical clips, frames, and
+scoring, using the released imagebind_huge checkpoint and revision-pinned LanguageBind
+checkpoints (LanguageBind_Audio_FT + LanguageBind_Image). Note on LanguageBind: its
+branches fine-tune separate copies of the text tower, which diverge (mean caption cosine
+0.55 between the audio and image branches' text embeddings) — the cross-branch binding
+weakens, which is consistent with its emergent audio↔image score. This model's shared
+space cannot drift by construction (the base is frozen; every training run asserts
+parameter-level identity).*
 
 Full audio→image metrics (per-modality mean-centered gallery — the readout implemented by
 `FusionEmbedder.center`; chance R@10 = 0.014):

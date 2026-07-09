@@ -261,9 +261,16 @@ on audio–text only — its audio↔image alignment is emergent):
 | Model | audio↔image | audio↔text | text↔image |
 |---|---|---|---|
 | ImageBind-Huge | **0.718 / 0.720** | 0.404 / 0.348 | 0.243 / 0.282 |
+| LanguageBind | 0.365 / 0.415 | 0.547 / 0.331 | 0.221 / 0.283 |
 | fusion-embedding-1-2b-preview v0.1 | 0.368 / 0.388 | 0.555 / 0.592 | 0.331 / 0.319 |
 | fusion-embedding-1-2b-preview v0.2 | 0.418 / 0.440 | 0.588 / 0.631 | 0.331 / 0.319 |
 | **fusion-embedding-1-2b-preview v0.3** | 0.407 / 0.428 | **0.625 / 0.645** | **0.331 / 0.319** |
+
+Each baseline wins only its supervised pair — except LanguageBind, whose supervised
+audio↔text this model also exceeds. LanguageBind's branches fine-tune diverging copies
+of the text tower (measured mean caption cosine 0.55 between branches), weakening its
+cross-branch binding — a direct illustration of why this project keeps the shared space
+frozen. Full protocol notes on the model card.
 
 Best emergent audio→image is v0.2's R@10 0.418 (29× chance; v0.3: 0.407 — the in-domain
 fine-tune trades ~1 point of emergent alignment for its AudioCaps gains) — with zero
