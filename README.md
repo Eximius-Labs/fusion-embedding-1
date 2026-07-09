@@ -274,6 +274,20 @@ green = the clip's exact frame among the top 5):
 
 *Example frames from the [VGGSound](https://www.robots.ox.ac.uk/~vgg/data/vggsound/) dataset (CC-BY-4.0), shown for evaluation illustration.*
 
+**Query robustness (UIQ).** On the [UIQ benchmark](https://github.com/JudeJiwoo/Omni-Embed-Audio)
+(user-intent query reformulations; Yoo et al., ACL 2026 — queries CC-BY-4.0), evaluated on
+the identical 1,045-clip Clotho pool, v0.3 averages R@10 51.8 across the four positive
+query types — parity with LAION-CLAP (53.1), below M2D-CLAP (60.5) and OEA-Qwen7B (62.9).
+For context: OEA trains a comparable parameter budget (13.7–17.2M LoRA) inside a dedicated
+7B audio-text model with no image/video capability; this model spends its 16.4M keeping
+the full multimodal space frozen. Reproduce with `modal_app.py::uiq_eval`.
+
+**Inference-time option.** `modal_app.py::rescore_qbnorm` adds
+[QB-Norm](https://arxiv.org/abs/2112.12777) (CVPR 2022) test-time hubness correction with
+a training-caption querybank (no test-set access): measured +1.7 AudioCaps / +1.0 Clotho
+T→A R@10. Reported separately from headline numbers, since published baselines do not
+use it.
+
 Text, image, and video performance is the frozen base model's published MMEB-V2 results,
 unchanged by construction.
 
@@ -326,9 +340,12 @@ fully testable without hardware.
       (484K pairs — AudioCaps A→T R@10 0.626 → 0.717, Clotho zero-shot 0.252 → 0.448), and
       [v0.3-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.3-preview)
       (AudioCaps in-domain fine-tune stage — A→T R@1 0.279 → 0.332, R@10 0.717 → 0.741)
-- [ ] **P2 (in progress) — Corpus scaling + data quality**: larger FreeSound pool,
-      relevance-aware training (soft labels, false-negative masking), model-based
-      recaptioning, domain-weighted sampling, connector capacity re-test at scale
+- [ ] **P2 (in progress) — Corpus scaling + data quality**: corpus extended to 592K
+      (FreeSound tail + BBC Sound Effects); relevance-aware training validated in a
+      matched A/B (soft labels + false-negative masking: +2.6 A→T R@10 at equal steps);
+      in-domain fine-tune stage shipped in v0.3; connector capacity re-test at scale
+      complete (d=384 confirmed twice). Remaining: model-based recaptioning and
+      caption-quality gating, domain-weighted sampling
 - [ ] **P3 — Speech parity + grounding**: heavy multilingual speech, more query
       tokens, direct audio↔video pairs
 - [ ] **P4 — Release**: pre-registered five-modality benchmark, model soup,
