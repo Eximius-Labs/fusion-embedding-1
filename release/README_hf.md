@@ -28,7 +28,7 @@ any direction between modalities.
   byte-identical to the original release, so its text/image/video retrieval performance
   (MMEB-V2) carries over unchanged.
 - **Emergent cross-modal alignment.** The connector is trained exclusively on audio–text
-  pairs. Audio→image retrieval nonetheless reaches R@10 0.418 over 696 VGGSound candidates
+  pairs. Audio→image retrieval nonetheless reaches R@10 0.407 over 696 VGGSound candidates
   (chance: 0.014) with no audio-visual pairs in training — alignment to text places audio
   in the space the base already shares across modalities.
 - **Matryoshka representation.** Embeddings truncate to {2048, 1536, 1024, 512, 256, 128,
@@ -36,9 +36,11 @@ any direction between modalities.
 - **Compact distribution.** This repository ships the connector and normalization
   statistics (~60 MB); the frozen towers are downloaded from their original repositories.
 
-This is a **research preview**, currently at **v0.2** (trained on a 484K-pair corpus).
-v0.1 (131K pairs) remains downloadable via the `v0.1-preview` tag; `v0.2-preview` pins
-the current version. Both are compared below; pin a tag if you build on this model.
+This is a **research preview**, currently at **v0.3**: the v0.2 contrastive stage (484K
+pairs) followed by a connector-only in-domain fine-tune on the AudioCaps train split.
+Earlier versions remain downloadable via the `v0.1-preview` and `v0.2-preview` tags;
+`v0.3-preview` pins the current version. All are compared below; pin a tag if you build
+on this model.
 
 ## Evaluation
 
@@ -52,7 +54,8 @@ min-rank over references:
 | Cacophony | 0.553 | 0.924 | 0.864 |
 | M2D-CLAP | **0.593** | **0.928** | **0.886** |
 | fusion-embedding-1-2b-preview v0.1 | 0.216 | 0.626 | 0.680 |
-| **fusion-embedding-1-2b-preview v0.2** | 0.279 | 0.717 | 0.736 |
+| fusion-embedding-1-2b-preview v0.2 | 0.279 | 0.717 | 0.736 |
+| **fusion-embedding-1-2b-preview v0.3** | 0.332 | 0.741 | 0.746 |
 
 *CLAP-family models fine-tune both encoders end-to-end and include AudioCaps and Clotho
 training data; this model keeps both towers frozen and trains only the connector.*
@@ -64,7 +67,11 @@ from training data):
 |---|---|---|
 | WavCaps CNN14-BERT (zero-shot) | **0.576** | **0.549** |
 | fusion-embedding-1-2b-preview v0.1 | 0.252 | 0.329 |
-| **fusion-embedding-1-2b-preview v0.2** | 0.448 | 0.449 |
+| fusion-embedding-1-2b-preview v0.2 | 0.448 | 0.449 |
+| **fusion-embedding-1-2b-preview v0.3** | 0.433 | 0.460 |
+
+*v0.3's in-domain AudioCaps stage trades 1.5 points of zero-shot Clotho A→T for the
+AudioCaps gains above; T→A improves in both settings.*
 
 **Cross-modal retrieval** — VGGSound-AV, 696 audio/video-frame pairs (chance R@10 = 0.014).
 R@10 shown as audio-side → other / other → audio-side:
@@ -73,7 +80,8 @@ R@10 shown as audio-side → other / other → audio-side:
 |---|---|---|---|
 | ImageBind-Huge | **0.718 / 0.720** | 0.404 / 0.348 | 0.243 / 0.282 |
 | fusion-embedding-1-2b-preview v0.1 | 0.368 / 0.388 | 0.555 / 0.592 | 0.331 / 0.319 |
-| **fusion-embedding-1-2b-preview v0.2** | 0.418 / 0.440 | **0.588 / 0.631** | **0.331 / 0.319** |
+| fusion-embedding-1-2b-preview v0.2 | 0.418 / 0.440 | 0.588 / 0.631 | 0.331 / 0.319 |
+| **fusion-embedding-1-2b-preview v0.3** | 0.407 / 0.428 | **0.625 / 0.645** | **0.331 / 0.319** |
 
 *ImageBind trains directly on audio–image pairs, so that pair is its supervised direction;
 its audio–text alignment is emergent. This model trains on audio–text only; its
@@ -86,9 +94,14 @@ Full audio→image metrics (per-modality mean-centered gallery — the readout i
 | Version | R@1 | R@5 | R@10 | mAP@10 |
 |---|---|---|---|---|
 | v0.1 | 0.085 | 0.260 | 0.368 | 0.155 |
-| **v0.2** | **0.088** | **0.315** | **0.418** | **0.179** |
+| v0.2 | **0.088** | **0.315** | **0.418** | **0.179** |
+| v0.3 | 0.085 | 0.297 | 0.407 | 0.177 |
 
-**What audio→image retrieval looks like.** The 0.418 above is not only an aggregate — the
+*The v0.3 in-domain fine-tune costs ~1 point of emergent audio→image alignment while
+improving audio↔text (see the cross-modal table); v0.2 remains available if audio→image
+is the primary use case.*
+
+**What audio→image retrieval looks like.** These numbers are not only aggregates — the
 retrievals are organized by sound. Real examples (v0.2 checkpoint) on VGGSound-696
 (query clip's frame left, top-5 retrieved images right; green = the clip's exact frame):
 
@@ -129,7 +142,9 @@ into the base model's input embedding space; its outputs occupy placeholder posi
 the input stream, mirroring the base model's image-token mechanism. Training is
 contrastive (InfoNCE over the Matryoshka ladder, symmetric, with a full-corpus
 frozen-text negative bank — 484K captions at v0.2) against the base model's text
-embeddings in its native input format.
+embeddings in its native input format. v0.3 adds a second, connector-only fine-tuning
+stage on the AudioCaps train split (400 steps at a reduced learning rate), warm-started
+from the v0.2 checkpoint.
 
 **Input formatting.** All inputs use the base model's chat-template format (instruction in
 the system turn, content in the user turn, last-token pooling). Embedding quality is
@@ -144,7 +159,7 @@ from inference import FusionEmbedder
 
 fe = FusionEmbedder.from_pretrained("EximiusLabs/fusion-embedding-1-2b-preview",
                                     device="cuda")
-# or pin a version: revision="v0.2-preview" (current) / "v0.1-preview"
+# or pin a version: revision="v0.3-preview" (current) / "v0.2-preview" / "v0.1-preview"
 
 a = fe.embed_audio("dog_barking.wav")                        # [2048]
 t = fe.embed_text("a dog barks while rain falls")            # [2048]
@@ -159,8 +174,9 @@ a256 = fe.embed_audio("dog_barking.wav", dim=256)            # Matryoshka trunca
 
 v0.2 was trained on ~484K audio–caption pairs: the full AudioCaps train split (45K),
 FSD50K, WavCaps/AudioSet_SL, and a 318K-clip subset of LAION-FreeSound, using 10-second
-training windows (random crop for longer clips). v0.1 used a 131K-pair subset of the same
-sources. As this mix includes YouTube-sourced and research-licensed corpora, the preview
+training windows (random crop for longer clips). v0.3 continues the v0.2 checkpoint with
+a 400-step fine-tune on the AudioCaps train split only. v0.1 used a 131K-pair subset of
+the same sources. As this mix includes YouTube-sourced and research-licensed corpora, the preview
 is released under **CC-BY-NC-4.0**. Evaluation sets (AudioCaps test, Clotho, VGGSound,
 ESC-50) are excluded from training by clip id.
 

@@ -66,28 +66,28 @@ The connector is trained **only** on audio↔text pairs — it never sees a sing
 audio–image example. But because text, image, and video already share the frozen
 base's space, audio lands there too, and **audio→image retrieval emerges for free**.
 On VGGSound-696 (held out, in the training blacklist → zero leakage), the released
-preview retrieves the matching image from sound alone at **R@10 0.368 — 26× the 0.014
-random-chance rate**. Real examples:
+previews retrieve the matching image from sound alone at **R@10 up to 0.418 — 29× the
+0.014 random-chance rate**. Real examples (v0.2 checkpoint):
 
 **Direct hits** — the clip's own frame comes back in the top 5, surrounded by the same kind of scene:
 
 | The sound | What it retrieved (top-5) | Exact frame |
 |---|---|---|
-| A siren | its own ambulance, then more emergency vehicles | rank 2 |
-| *"Switch on the good piece"* (speech) | the appliance being switched on | rank 1 |
-| A whirring kitchen motor | its own blender, among other mixers | rank 3 |
-| An emergency-vehicle siren | fire engines and ambulances | rank 4 |
-| Metallic clanking and banging | the kitchen it came from | rank 5 |
+| Metallic clanking and banging | the kitchen it came from, first | rank 1 |
+| A dog howling | its own dog, then more howling dogs | rank 1 |
+| A cat purring | its own cat, then more purring and meowing cats | rank 1 |
+| A siren with a dog howling | its own scene among howling dogs | rank 2 |
+| *"Switch on the good piece"* (speech) | the blender being switched on | rank 2 |
 
-**Right neighbourhood** — the exact frame ranks lower (often it's a poor still), but every
-top result is the correct *sound* category — the shared space placing audio among the right images:
+**Right neighbourhood** — the exact frame ranks lower (often it's a poor still), but the
+top results are the correct *sound* category — the shared space placing audio among the right images:
 
 | The sound | What it retrieved (top-5) | Exact frame |
 |---|---|---|
-| A distinct click | people typing at keyboards | rank 109 |
-| A power motor | an angle grinder, a belt sander, a table saw | rank 68 |
-| A single cowbell note | cattle herds — one wearing a bell | rank 6 |
-| High squeaks and chirps | chickens, crows, a quail, a parrot | rank 104 |
+| A man speaking Spanish amid birdsong | a man speaking with birds chirping behind | rank 13 |
+| A cat's rhythmic purring | purring and meowing cats | rank 15 |
+| Bird chirps and tweets | songbirds, owls, a cawing crow | rank 18 |
+| A power-tool whirring | drills and small motors | rank 32 |
 
 Scored with the released `fusion-embedding-1-2b-preview` on `mteb/VGGSound_AV_RETRIEVAL`,
 per-modality-centered geometry (see the model card for the full cross-modal table, including
@@ -236,8 +236,9 @@ uv run --env-file .env modal run --detach modal_app.py::train_frames_a100  # con
 ## Results — preview checkpoints
 
 Numbers for [`fusion-embedding-1-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
-— v0.1 (131K-pair corpus) and v0.2 (484K-pair corpus incl. the full AudioCaps train split
-and a 318K LAION-FreeSound subset), same d=384 connector. Full tables and protocol details
+— v0.1 (131K-pair corpus), v0.2 (484K-pair corpus incl. the full AudioCaps train split
+and a 318K LAION-FreeSound subset), and v0.3 (v0.2 + a connector-only in-domain fine-tune
+on the AudioCaps train split), same d=384 connector. Full tables and protocol details
 are on the model card.
 
 **Audio–text retrieval** (published protocols):
@@ -245,9 +246,11 @@ are on the model card.
 | Benchmark | Version | A→T R@1 | A→T R@10 | T→A R@10 |
 |---|---|---|---|---|
 | AudioCaps test (883 clips, 5-ref min-rank) | v0.1 | 0.216 | 0.626 | 0.680 |
-| AudioCaps test | **v0.2** | **0.279** | **0.717** | **0.736** |
+| AudioCaps test | v0.2 | 0.279 | 0.717 | 0.736 |
+| AudioCaps test | **v0.3** | **0.332** | **0.741** | **0.746** |
 | Clotho v2.1 eval, zero-shot (1,045 × 5 refs) | v0.1 | 0.064 | 0.252 | 0.329 |
-| Clotho v2.1 eval, zero-shot | **v0.2** | **0.135** | **0.448** | **0.449** |
+| Clotho v2.1 eval, zero-shot | v0.2 | **0.135** | **0.448** | 0.449 |
+| Clotho v2.1 eval, zero-shot | **v0.3** | **0.135** | 0.433 | **0.460** |
 
 CLAP-family models that fine-tune both encoders end-to-end score higher on AudioCaps
 (A→T R@10 0.906–0.928); this model keeps both towers frozen.
@@ -259,12 +262,13 @@ on audio–text only — its audio↔image alignment is emergent):
 |---|---|---|---|
 | ImageBind-Huge | **0.718 / 0.720** | 0.404 / 0.348 | 0.243 / 0.282 |
 | fusion-embedding-1-2b-preview v0.1 | 0.368 / 0.388 | 0.555 / 0.592 | 0.331 / 0.319 |
-| **fusion-embedding-1-2b-preview v0.2** | 0.418 / 0.440 | **0.588 / 0.631** | **0.331 / 0.319** |
+| fusion-embedding-1-2b-preview v0.2 | 0.418 / 0.440 | 0.588 / 0.631 | 0.331 / 0.319 |
+| **fusion-embedding-1-2b-preview v0.3** | 0.407 / 0.428 | **0.625 / 0.645** | **0.331 / 0.319** |
 
-Full v0.2 audio→image metrics (per-modality mean-centered readout): R@1 0.088, R@5 0.315,
-R@10 0.418 (29× chance), mAP@10 0.179 — with zero audio–image training pairs. What that
-looks like (v0.2 examples; query clip's frame left; green = the clip's exact frame among
-the top 5):
+Best emergent audio→image is v0.2's R@10 0.418 (29× chance; v0.3: 0.407 — the in-domain
+fine-tune trades ~1 point of emergent alignment for its AudioCaps gains) — with zero
+audio–image training pairs. What that looks like (v0.2 examples; query clip's frame left;
+green = the clip's exact frame among the top 5):
 
 ![Audio-to-image retrieval examples](assets/audio_to_image_gallery.png)
 
@@ -319,7 +323,9 @@ fully testable without hardware.
       [v0.1-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.1-preview)
       (131K pairs) and
       [v0.2-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.2-preview)
-      (484K pairs — AudioCaps A→T R@10 0.626 → 0.717, Clotho zero-shot 0.252 → 0.448)
+      (484K pairs — AudioCaps A→T R@10 0.626 → 0.717, Clotho zero-shot 0.252 → 0.448), and
+      [v0.3-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.3-preview)
+      (AudioCaps in-domain fine-tune stage — A→T R@1 0.279 → 0.332, R@10 0.717 → 0.741)
 - [ ] **P2 (in progress) — Corpus scaling + data quality**: larger FreeSound pool,
       relevance-aware training (soft labels, false-negative masking), model-based
       recaptioning, domain-weighted sampling, connector capacity re-test at scale
