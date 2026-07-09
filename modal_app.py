@@ -3723,6 +3723,168 @@ def imagebind_vggsound(dataset: str = "mteb/VGGSound_AV_RETRIEVAL", limit: int =
     return out
 
 
+# Separate image for the LanguageBind baseline (same isolation pattern as imagebind_image):
+# its modeling code imports `_expand_mask` from transformers' CLIP internals — removed in
+# transformers 4.35 — so it hard-requires transformers==4.30.2 (upstream pin) and must not
+# contaminate the training image. Upstream ships no setup.py/PyPI package, so we clone the
+# repo at a pinned commit and put it on PYTHONPATH.
+languagebind_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("git", "ffmpeg", "libsndfile1")
+    .pip_install("torch==2.1.2", "torchvision==0.16.2", "torchaudio==2.1.2",
+                 extra_index_url="https://download.pytorch.org/whl/cu121")
+    .pip_install("transformers==4.30.2", "tokenizers==0.13.3", "huggingface_hub==0.25.2",
+                 "peft==0.4.0", "accelerate==0.20.3", "einops", "ftfy", "regex",
+                 # cv2/decord/pytorchvideo: imported at package level by the video/depth
+                 # processors even though we only use audio+image+text.
+                 "opencv-python-headless==4.7.0.72", "decord==0.6.0", "pytorchvideo==0.1.5",
+                 "soundfile", "datasets==3.2.0", "av>=10,<13", "pillow", "numpy<2")
+    .run_commands("git clone https://github.com/PKU-YuanGroup/LanguageBind.git /opt/LanguageBind"
+                  " && cd /opt/LanguageBind"
+                  " && git checkout 7070c53375661cdb235801176b564b45f96f0648")
+    .env({"PYTHONPATH": "/opt/LanguageBind"})
+    .add_local_python_source("fusion_embedding")
+)
+
+
+@app.function(gpu="L4", image=languagebind_image, secrets=[hf_secret], volumes={VOL: volume},
+              cpu=8.0, memory=32768, timeout=2 * 3600, env=HF_ENV)
+def languagebind_vggsound(dataset: str = "mteb/VGGSound_AV_RETRIEVAL", limit: int = 0,
+                          frame_index: int = 75, batch: int = 24) -> dict:
+    """Second unified-model baseline: LanguageBind (ICLR'24) on OUR VGGSound-696 protocol.
+
+    Mirrors imagebind_vggsound exactly (same 696 pairs, same frame_index, same
+    retrieval_report) so the model-card table gets a second ImageBind-successor row.
+    Audio tower: LanguageBind_Audio_FT; image tower: LanguageBind_Image; text: the image
+    checkpoint's OpenCLIP text encoder (one unified text space, as the upstream LanguageBind
+    wrapper does; NB the FT audio checkpoint's own text tower has drifted — see comment
+    below). Embeds = pooled -> projection -> L2-normalize, identical to the upstream
+    wrapper with use_temp=False."""
+    import io
+    import json
+    import os
+
+    import soundfile as sf
+    import torch
+
+    from fusion_embedding.train_stage1 import retrieval_report
+    from fusion_embedding.paths import checkpoints_dir, hf_cache_dir
+
+    from languagebind import (LanguageBindAudio, LanguageBindAudioProcessor,
+                              LanguageBindImage, LanguageBindImageProcessor,
+                              LanguageBindImageTokenizer)
+
+    AUDIO_CKPT = "LanguageBind/LanguageBind_Audio_FT"
+    AUDIO_REV = "4820c496563c46acfb1ff9a486fae5319f16257e"   # main @ 2024-02-01
+    IMAGE_CKPT = "LanguageBind/LanguageBind_Image"
+    IMAGE_REV = "d8c2e37b439f4fc47c649dc8b90cdcd3a4e0c80e"   # main @ 2024-02-01
+
+    cache = str(hf_cache_dir() / "languagebind")
+    os.makedirs(cache, exist_ok=True)
+    dev = "cuda"
+    amodel = LanguageBindAudio.from_pretrained(AUDIO_CKPT, revision=AUDIO_REV, cache_dir=cache).eval().to(dev)
+    imodel = LanguageBindImage.from_pretrained(IMAGE_CKPT, revision=IMAGE_REV, cache_dir=cache).eval().to(dev)
+    tok = LanguageBindImageTokenizer.from_pretrained(IMAGE_CKPT, revision=IMAGE_REV, cache_dir=cache)
+    aproc = LanguageBindAudioProcessor(amodel.config)
+    iproc = LanguageBindImageProcessor(imodel.config)
+
+    import av as _av
+    from datasets import Audio as DAudio, Video as DVideo, load_dataset
+    ds = load_dataset(dataset, split="test", streaming=True)
+    ds = ds.cast_column("audio", DAudio(decode=False)).cast_column("video", DVideo(decode=False))
+
+    tmp = "/tmp/lbpairs"
+    os.makedirs(tmp, exist_ok=True)
+    wavs, jpgs, captions = [], [], []
+    n_bad = 0
+    for i, row in enumerate(ds):
+        if limit and len(wavs) >= limit:
+            break
+        try:
+            wav, sr0 = sf.read(io.BytesIO(row["audio"]["bytes"]), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            wp = f"{tmp}/a_{i}.wav"
+            sf.write(wp, wav, sr0)
+            with _av.open(io.BytesIO(row["video"]["bytes"])) as c:
+                last = None
+                for j, fr in enumerate(c.decode(video=0)):
+                    last = fr
+                    if j == frame_index:
+                        break
+            if last is None:
+                n_bad += 1
+                continue
+            jp = f"{tmp}/i_{i}.jpg"
+            last.to_image().convert("RGB").save(jp, quality=92)
+            wavs.append(wp)
+            jpgs.append(jp)
+            captions.append(str(row.get("audio_caption") or ""))
+        except Exception as e:                                     # noqa: BLE001
+            n_bad += 1
+            if n_bad <= 3:
+                print(f"decode fail {i}: {type(e).__name__}: {e}")
+    n = len(wavs)
+    print(f"prepared {n} pairs ({n_bad} failed)")
+
+    @torch.no_grad()
+    def embed(kind, items):
+        chunks = []
+        for s in range(0, n, batch):
+            part = items[s: s + batch]
+            if kind == "audio":
+                px = aproc(images=part)["pixel_values"].to(dev)
+                emb = amodel.visual_projection(amodel.vision_model(pixel_values=px)[1])
+            elif kind == "image":
+                px = iproc(images=part)["pixel_values"].to(dev)
+                emb = imodel.visual_projection(imodel.vision_model(pixel_values=px)[1])
+            else:
+                enc = tok(part, max_length=77, padding="max_length", truncation=True,
+                          return_tensors="pt")
+                enc = {k: v.to(dev) for k, v in enc.items()}
+                m = amodel if kind == "text_audio_tower" else imodel
+                emb = m.text_projection(m.text_model(**enc)[1])
+            chunks.append(torch.nn.functional.normalize(emb, dim=-1).float().cpu())
+            if s % (batch * 8) == 0:
+                print(f"  {kind}: {s + len(part)}/{n}", flush=True)
+        return torch.cat(chunks)
+
+    a = embed("audio", wavs)
+    v = embed("image", jpgs)
+    t = embed("text", captions)
+    # The FT audio checkpoint's text tower drifted from the image one (measured cos ~0.51 on
+    # a 16-pair smoke, 2026-07-08 — "FT" full-tunes the text tower too, so the frozen-language
+    # binding assumption does NOT hold for the FT variants). Headline audio<->text uses the
+    # image checkpoint's tower (one unified text space for all three pairs, matching the
+    # upstream LanguageBind wrapper); audio<->text against the audio checkpoint's OWN tower
+    # is reported as a supplementary row.
+    t_own = embed("text_audio_tower", captions)
+    print(f"embedded audio {tuple(a.shape)} image {tuple(v.shape)} text {tuple(t.shape)}")
+    tower_cos = torch.nn.functional.cosine_similarity(t, t_own).mean().item()
+    print(f"text-tower check cos(audio_ckpt, image_ckpt) = {tower_cos:.6f}")
+    sims = (a @ v.T)
+    print(f"a@v sims: mean {sims.mean():.4f} std {sims.std():.4f} diag {sims.diag().mean():.4f}")
+
+    def _score(x, y):
+        return {k: round(float(vv), 4) for k, vv in retrieval_report(x, y).items()}
+
+    out = {"model": "languagebind", "dataset": dataset, "n_pairs": n,
+           "audio_ckpt": f"{AUDIO_CKPT}@{AUDIO_REV}", "image_ckpt": f"{IMAGE_CKPT}@{IMAGE_REV}",
+           "repo_commit": "7070c53375661cdb235801176b564b45f96f0648",
+           "text_tower_cos_audio_vs_image_ckpt": round(tower_cos, 4),
+           "chance_R@10": round(10.0 / max(n, 1), 4),
+           "results": {"audio_vs_image": _score(a, v),
+                       "audio_vs_text": _score(a, t),
+                       "text_vs_image": _score(t, v),
+                       "audio_vs_text_audio_ckpt_tower": _score(a, t_own)}}
+    if not limit:
+        with open(str(checkpoints_dir() / "languagebind_vggsound696.json"), "w") as fh:
+            json.dump(out, fh, indent=2)
+        volume.commit()
+    print("LANGUAGEBIND:", json.dumps(out, indent=2))
+    return out
+
+
 @app.function(secrets=[hf_secret], volumes={VOL: volume}, cpu=8.0, memory=65536, timeout=3600, env=HF_ENV)
 def peek_vision() -> dict:
     """Phase 0 recon: how does the frozen Qwen3-VL-Embedding base want IMAGES fed to it?
