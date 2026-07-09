@@ -145,6 +145,12 @@ results are the correct sound category:
 | Bird chirps and tweets | songbirds, owls, a cawing crow | rank 18 |
 | A power-tool whirring | drills and small motors | rank 32 |
 
+**MAEB (beta).** On 10 tasks of the MTEB team's Massive Audio Embedding Benchmark
+(mteb 2.18.0, v0.2 checkpoint; ranks vs the live leaderboard as of 2026-07-09, 21–65
+models per task): UrbanSound8K T2A retrieval #3, Ravdess zero-shot #4, FSD2019Kaggle #6,
+BeijingOpera #6, with mid-field placements on speech/music tasks the model was never
+trained for. Official leaderboard submission in progress.
+
 Text, image, and video benchmarks are the base model's published MMEB-V2 results, which
 are unaffected by this extension.
 

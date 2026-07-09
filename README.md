@@ -293,6 +293,24 @@ For context: OEA trains a comparable parameter budget (13.7–17.2M LoRA) inside
 7B audio-text model with no image/video capability; this model spends its 16.4M keeping
 the full multimodal space frozen. Reproduce with `modal_app.py::uiq_eval`.
 
+**MAEB (Massive Audio Embedding Benchmark).** Scores on 10 MAEB(beta) tasks
+(mteb 2.18.0, v0.2 checkpoint), with ranks against the live leaderboard as of
+2026-07-09 (21–65 models per task, including 7–9B omni models; official submission
+in progress):
+
+| Task | Score | Rank | | Task | Score | Rank |
+|---|---|---|---|---|---|---|
+| UrbanSound8K T2A | 0.94 | **#3**/25 | | SpeechCommands ZS | 19.0 | #11/25 |
+| Ravdess zero-shot | 32.2 | **#4**/25 | | Clotho T2A | 27.8 | #12/25 |
+| FSD2019Kaggle | 77.8 | **#6**/65 | | MACS T2A | 13.2 | #14/25 |
+| BeijingOpera | 92.8 | **#6**/65 | | GTZAN reranking | 70.7 | #16/65 |
+| Vehicle clustering | 3.5 | #17/65 | | GTZAN genre | 63.9 | #29/64 |
+
+The strongest placements are environmental-sound tasks — the category the MAEB paper
+identifies as contrastive audio-text models' strength — achieved with 16.4M trained
+parameters, no music or speech training, and training data verifiably disjoint from
+every task above. Reproduce with `modal_app.py::maeb_eval`.
+
 **Inference-time option.** `modal_app.py::rescore_qbnorm` adds
 [QB-Norm](https://arxiv.org/abs/2112.12777) (CVPR 2022) test-time hubness correction with
 a training-caption querybank (no test-set access): measured +1.7 AudioCaps / +1.0 Clotho
