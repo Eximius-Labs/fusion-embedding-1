@@ -872,6 +872,132 @@ def ingest_clotho_eval(frame_shard: str = "clotho_eval5", zenodo_record: str = "
 
 @app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=6 * 3600,
               memory=32768, cpu=4.0, env=HF_ENV)
+def ingest_mecat_eval(frame_shard: str = "mecat_eval", repo: str = "mispeech/MECAT-Caption",
+                      revision: str = "be4a24c3f7309d74208e08a7cce49e72cb7a5834",
+                      domains: str = "000,00A", audio_feature_layer: str = "post_proj",
+                      shard_size: int = 512, limit: int = 0) -> dict:
+    """Ingest the MECAT-Caption (arXiv:2507.23511, CC-BY-3.0) sound-only TEST domains as an
+    eval shard. Recon 2026-07-08: 000/test = 179 clips ("nothing present"), 00A/test = 848
+    clips (sound events, no speech/music) — OEA's published "MECAT 847 pairs" is almost
+    certainly the 00A test set (one clip lost their side). FLAC 16 kHz mono ~10.05 s; per
+    clip a JSON with 6 caption types x 3 paraphrases (speech/music are 'None' placeholders
+    on these domains).
+
+    ``captions_multi`` stores the ORDERED single-caption protocol CANDIDATES per clip —
+    ``caption_fields`` in the index documents the order: short_0, long_0, sound_0,
+    environment_0 (paraphrase [0] of each usable type). Score ONE variant via
+    ``rescore_816(caption_index=k)``; leaving caption_index unset would min-rank over the
+    variants, which is NOT the published protocol. ``captions_all`` keeps every paraphrase
+    for auditability. Gallery variants (00A-only, leakage-excluded) are selected at score
+    time via ``id_allowlist_file`` on index ``clip_ids``."""
+    import io
+    import json
+    import os
+    import tarfile
+
+    import librosa
+    import soundfile as sf
+    import torch
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoFeatureExtractor
+
+    from fusion_embedding.data import write_frame_shard
+    from fusion_embedding.hf_components import load_audio_tower
+    from fusion_embedding.paths import frames_dir
+
+    CAPTION_FIELDS = ["short", "long", "sound", "environment"]
+
+    work = "/tmp/mecat"; os.makedirs(work, exist_ok=True)
+    clips: list = []                                             # (clip_id, domain, flac_bytes, cap_json)
+    for dom in [d.strip() for d in domains.split(",") if d.strip()]:
+        tar_path = hf_hub_download(repo, f"{dom}/test_0000-0000000.tar.gz",
+                                   repo_type="dataset", revision=revision)
+        flacs, jsons = {}, {}
+        with tarfile.open(tar_path, "r:gz") as tf:
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                base = os.path.basename(m.name)
+                if base.endswith(".flac"):
+                    flacs[base[:-5]] = tf.extractfile(m).read()
+                elif base.endswith(".json"):
+                    jsons[base[:-5]] = json.loads(tf.extractfile(m).read().decode("utf-8"))
+        paired = sorted(set(flacs) & set(jsons))
+        print(f"domain {dom}: {len(flacs)} flac / {len(jsons)} json / {len(paired)} paired", flush=True)
+        clips.extend((cid, dom, flacs[cid], jsons[cid]) for cid in paired)
+    if limit:
+        clips = clips[:limit]
+
+    token = os.environ.get("HF_TOKEN") or None
+    dev = "cuda"
+    fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True, token=token)
+    sr = fe.sampling_rate
+    enc, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16,
+                                         audio_feature_layer=audio_feature_layer)
+
+    out_dir = frames_dir(frame_shard); os.makedirs(str(out_dir), exist_ok=True)
+    shard_recs, captions_multi, captions_all, clip_ids, doms, shard_files = [], [], [], [], [], []
+    n = n_bad = 0
+
+    def _write():
+        if not shard_recs:
+            return
+        name = f"shard-{len(shard_files):04d}.pt"
+        write_frame_shard(out_dir / name, shard_recs, half=True)
+        shard_files.append(name); shard_recs.clear(); volume.commit()
+
+    for cid, dom, flac_bytes, cap in clips:
+        try:
+            wav, sr0 = sf.read(io.BytesIO(flac_bytes), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sr0 != sr:
+                wav = librosa.resample(wav, orig_sr=sr0, target_sr=sr)
+        except Exception as e:                                   # noqa: BLE001
+            n_bad += 1
+            if n_bad <= 3:
+                print(f"decode fail {cid}: {type(e).__name__}: {e}")
+            continue
+        feats = fe(wav, sampling_rate=sr, return_tensors="pt", return_attention_mask=True,
+                   padding="max_length", truncation=True)
+        mel = feats["input_features"][0]
+        am = feats.get("attention_mask")
+        if am is not None:
+            mel = mel[:, : int(am[0].sum().item())]
+        with torch.no_grad():
+            frames, fmask = enc(mel.unsqueeze(0).to(dev),
+                                torch.ones(1, mel.shape[1], dtype=torch.bool, device=dev))
+        t = int(fmask[0].sum().item())
+        variants = [str(cap[f][0]) for f in CAPTION_FIELDS]
+        shard_recs.append({"frames": frames[0, :t].cpu().contiguous(),
+                           "text": variants[1], "task": "sound"})   # long_0 as the display text
+        captions_multi.append(variants)
+        captions_all.append({f: [str(x) for x in cap[f]] for f in CAPTION_FIELDS})
+        clip_ids.append(cid); doms.append(dom); n += 1
+        if len(shard_recs) >= shard_size:
+            _write()
+        if n % 200 == 0:
+            print(f"  {n} clips  bad={n_bad}", flush=True)
+    _write()
+
+    with open(str(out_dir / "index.json"), "w") as fh:
+        json.dump({"d_audio": d_audio, "shard_size": shard_size, "n_total": n,
+                   "shards": shard_files, "captions_multi": captions_multi,
+                   "caption_fields": [f"{f}_0" for f in CAPTION_FIELDS],
+                   "captions_all": captions_all, "clip_ids": clip_ids, "domains": doms,
+                   "source_repo": f"hf:{repo}@{revision}", "group_key": "clip_id",
+                   "captions": [c[1] for c in captions_multi]}, fh)
+    volume.commit()
+    result = {"frame_shard": frame_shard, "clips": n, "decode_fail": n_bad,
+              "caption_fields": [f"{f}_0" for f in CAPTION_FIELDS],
+              "by_domain": {d: doms.count(d) for d in set(doms)},
+              "shards": len(shard_files), "d_audio": d_audio}
+    print(f"INGEST_MECAT: {json.dumps(result)}")
+    return result
+
+
+@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=6 * 3600,
+              memory=32768, cpu=4.0, env=HF_ENV)
 def ingest_audiocaps_eval(frame_shard: str = "audiocaps_test816", repo: str = "OpenSound/AudioCaps",
                           split: str = "test", group_key: str = "youtube_id",
                           caption_col: str = "caption", audio_feature_layer: str = "post_proj",
@@ -2555,7 +2681,8 @@ def rescore_frames(frame_shard: str = "audiocaps10k_post_proj", steps: int = 400
 
 def _score_816_protocol(model, cfg, collator, eval_shard, *, device, dim=0, task="sound",
                         native_text_template=False,
-                        id_allowlist=None) -> dict:
+                        id_allowlist=None, caption_index: int = -1,
+                        caption_field: str = "") -> dict:
     """Score a LOADED model on a multi-caption eval set (min-rank over the N refs per clip).
 
     Shared by ``rescore_816`` (post-hoc, from a ckpt) and ``_train_frames_impl`` (end-of-run, so every
@@ -2583,6 +2710,22 @@ def _score_816_protocol(model, cfg, collator, eval_shard, *, device, dim=0, task
     with open(str(fdir / "index.json")) as fh:
         index = json.load(fh)
     caps_multi = index["captions_multi"]                        # list-of-lists, one per clip
+    if caption_field:
+        # Single-caption protocol from ANY field/paraphrase in the ingest's captions_all
+        # (e.g. "short_1" = short field, paraphrase [1]) — used for MECAT protocol variants
+        # that aren't among the primary captions_multi candidates. Overrides caption_index.
+        fld, par = caption_field.rsplit("_", 1)
+        caps_multi = [[str(c[fld][int(par)])] for c in index["captions_all"]]
+        caption_index = -2
+        print(f"caption_field={caption_field}: single-caption protocol")
+    if caption_index >= 0:
+        # Single-caption protocol variant (e.g. MECAT): captions_multi holds ORDERED
+        # candidate caption types (index "caption_fields"); pick exactly one — min-ranking
+        # over the variants would inflate scores vs the published single-caption protocol.
+        caps_multi = [[c[caption_index]] for c in caps_multi]
+        print(f"caption_index={caption_index} "
+              f"({index.get('caption_fields', ['?'] * (caption_index + 1))[caption_index]}): "
+              f"single-caption protocol")
     clip_indices = list(range(len(caps_multi)))
     n_total_clips = len(caps_multi)
     if id_allowlist is not None:                                # restrict to the exact canonical split
@@ -2634,9 +2777,11 @@ def _score_816_protocol(model, cfg, collator, eval_shard, *, device, dim=0, task
 
     rel = multicaption_relevance(group_ids, n_audio=n_clips)
     report = retrieval_report(audio_emb, text_emb, relevance=rel)
+    single = caption_index >= 0 or bool(caption_field)
     return {"eval_shard": eval_shard, "n_clips": n_clips, "n_captions": len(flat_caps), "dim": dim,
             "n_total_clips": n_total_clips, "split_filtered": id_allowlist is not None,
-            "protocol": "min-rank-over-refs", **report}
+            "caption_index": caption_index, "caption_field": caption_field,
+            "protocol": "single-caption" if single else "min-rank-over-refs", **report}
 
 
 @app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=2 * 3600,
@@ -2891,7 +3036,8 @@ def rescore_qbnorm(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocap
 def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audiocaps10k_post_proj",
                 steps: int = 4000, run_tag: str = "", load_in_4bit: bool = True,
                 task: str = "sound", dim: int = 0, id_allowlist_file: str = "",
-                native_text_template: bool = False) -> dict:
+                native_text_template: bool = False, caption_index: int = -1,
+                caption_field: str = "", out_tag: str = "") -> dict:
     """Score a saved connector on the PUBLISHED multi-caption protocol (min-rank over the 5 refs).
 
     ``eval_shard`` is a multi-caption eval set built by ``ingest_audiocaps_eval`` (index has
@@ -2947,8 +3093,10 @@ def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audioc
            "text_whitening_fitted": int(model.text_whitening.fitted),
            **_score_816_protocol(model, cfg, collator, eval_shard, device=dev, dim=dim, task=task,
                                  native_text_template=native_text_template,
-                                 id_allowlist=id_allowlist)}
-    with open(str(checkpoints_dir() / f"score816_{eval_shard}__{ckpt_shard}_step{steps}{run_tag}.json"), "w") as fh:
+                                 id_allowlist=id_allowlist, caption_index=caption_index,
+                                 caption_field=caption_field)}
+    with open(str(checkpoints_dir() /
+                  f"score816_{eval_shard}__{ckpt_shard}_step{steps}{run_tag}{out_tag}.json"), "w") as fh:
         json.dump(out, fh, indent=2)
     volume.commit()
     print("SCORE816:", json.dumps(out, indent=2))
@@ -4037,6 +4185,122 @@ def gemini_vggsound(dataset: str = "mteb/VGGSound_AV_RETRIEVAL", limit: int = 0,
             json.dump(out, fh, indent=2)
         volume.commit()
     print("GEMINI:", json.dumps(out, indent=2))
+    return out
+
+
+# Separate image for the LAION-CLAP protocol-validation baseline (MECAT): laion_clap pins
+# an old numpy and drags webdataset/torchlibrosa — keep it out of the training image.
+laion_clap_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("ffmpeg", "libsndfile1")
+    .pip_install("torch==2.1.2", "torchvision==0.16.2", "torchaudio==2.1.2",
+                 extra_index_url="https://download.pytorch.org/whl/cu121")
+    .pip_install("laion_clap==1.1.6", "transformers==4.36.2", "numpy==1.23.5",
+                 "soundfile", "librosa==0.10.2.post1", "huggingface_hub")
+    .add_local_python_source("fusion_embedding")
+)
+
+
+@app.function(gpu="L4", image=laion_clap_image, secrets=[hf_secret], volumes={VOL: volume},
+              cpu=8.0, memory=32768, timeout=2 * 3600, env=HF_ENV)
+def laion_mecat(repo: str = "mispeech/MECAT-Caption",
+                revision: str = "be4a24c3f7309d74208e08a7cce49e72cb7a5834",
+                limit: int = 0, batch: int = 24) -> dict:
+    """MECAT protocol RECONSTRUCTION: score LAION-CLAP (630k-audioset-best, the exact row
+    OEA published: t2a R@1/5/10 = 6.80/20.93/30.66) on every candidate protocol variant —
+    caption field (short/long/sound/environment x paraphrase 0/1/2) x gallery (00A-only 848
+    clips vs 000+00A 1027). The variant that reproduces their LAION row IS the protocol for
+    our own MECAT claims. Audio: FLAC 16 kHz -> resampled 48 kHz (CLAP's native rate)."""
+    import io
+    import json
+    import os
+    import tarfile
+
+    import librosa
+    import numpy as np
+    import soundfile as sf
+    import torch
+    from huggingface_hub import hf_hub_download
+
+    from fusion_embedding.paths import checkpoints_dir
+
+    import laion_clap
+
+    CAPTION_FIELDS = ["short", "long", "sound", "environment"]
+
+    clips = []                                                   # (clip_id, domain, wav48k, cap_json)
+    for dom in ("000", "00A"):
+        tar_path = hf_hub_download(repo, f"{dom}/test_0000-0000000.tar.gz",
+                                   repo_type="dataset", revision=revision)
+        flacs, jsons = {}, {}
+        with tarfile.open(tar_path, "r:gz") as tf:
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                base = os.path.basename(m.name)
+                if base.endswith(".flac"):
+                    flacs[base[:-5]] = tf.extractfile(m).read()
+                elif base.endswith(".json"):
+                    jsons[base[:-5]] = json.loads(tf.extractfile(m).read().decode("utf-8"))
+        for cid in sorted(set(flacs) & set(jsons)):
+            if limit and len(clips) >= limit:
+                break
+            wav, sr0 = sf.read(io.BytesIO(flacs[cid]), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sr0 != 48000:
+                wav = librosa.resample(wav, orig_sr=sr0, target_sr=48000)
+            clips.append((cid, dom, wav.astype(np.float32), jsons[cid]))
+    n = len(clips)
+    print(f"prepared {n} clips", flush=True)
+
+    model = laion_clap.CLAP_Module(enable_fusion=False)          # amodel=HTSAT-tiny
+    model.load_ckpt()                                            # 630k-audioset-best.pt (default)
+
+    with torch.no_grad():
+        a_chunks = []
+        for s in range(0, n, batch):
+            xs = np.stack([c[2] for c in clips[s: s + batch]])
+            a_chunks.append(model.get_audio_embedding_from_data(x=xs, use_tensor=False))
+            if s % (batch * 8) == 0:
+                print(f"  audio {s + len(xs)}/{n}", flush=True)
+        a = torch.tensor(np.concatenate(a_chunks), dtype=torch.float32)
+        a = torch.nn.functional.normalize(a, dim=-1)
+
+    domains = np.array([c[1] for c in clips])
+    galleries = {"00A_only": np.where(domains == "00A")[0],
+                 "000_plus_00A": np.arange(n)}
+
+    def t2a_recall(text_emb, idx):
+        sims = text_emb[idx] @ a[idx].T                           # [m, m]
+        ranks = (sims > sims.diag().unsqueeze(1)).sum(1) + 1      # rank of the true audio
+        return {f"t2a_R@{k}": round(float((ranks <= k).float().mean()) * 100, 2)
+                for k in (1, 5, 10)}
+
+    results = {}
+    with torch.no_grad():
+        for f in CAPTION_FIELDS:
+            for p in range(3):
+                texts = [str(c[3][f][p]) for c in clips]
+                t_chunks = [model.get_text_embedding(texts[s: s + 128], use_tensor=False)
+                            for s in range(0, n, 128)]
+                t = torch.tensor(np.concatenate(t_chunks), dtype=torch.float32)
+                t = torch.nn.functional.normalize(t, dim=-1)
+                for gname, idx in galleries.items():
+                    key = f"{f}_{p}|{gname}"
+                    results[key] = t2a_recall(t, torch.tensor(idx, dtype=torch.long))
+                    print(f"{key}: {results[key]}", flush=True)
+
+    out = {"model": "laion_clap 630k-audioset-best (enable_fusion=False, HTSAT-tiny)",
+           "pip": "laion_clap==1.1.6", "dataset": f"hf:{repo}@{revision}", "n_clips": n,
+           "published_oea_laion_row_t2a": {"R@1": 6.80, "R@5": 20.93, "R@10": 30.66},
+           "galleries": {k: int(len(v)) for k, v in galleries.items()},
+           "results": results}
+    if not limit:
+        with open(str(checkpoints_dir() / "laion_mecat_validation.json"), "w") as fh:
+            json.dump(out, fh, indent=2)
+        volume.commit()
+    print("LAION_MECAT:", json.dumps(out, indent=2))
     return out
 
 
