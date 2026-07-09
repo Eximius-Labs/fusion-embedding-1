@@ -80,9 +80,10 @@ R@10 shown as audio-side → other / other → audio-side:
 |---|---|---|---|
 | ImageBind-Huge | **0.718 / 0.720** | 0.404 / 0.348 | 0.243 / 0.282 |
 | LanguageBind | 0.365 / 0.415 | 0.547 / 0.331 | 0.221 / 0.283 |
+| Gemini Embedding 2 (API, 2026-07-09) | 0.312 / 0.316 | 0.379 / 0.374 | 0.273 / **0.366** |
 | fusion-embedding-1-2b-preview v0.1 | 0.368 / 0.388 | 0.555 / 0.592 | 0.331 / 0.319 |
 | fusion-embedding-1-2b-preview v0.2 | 0.418 / 0.440 | 0.588 / 0.631 | 0.331 / 0.319 |
-| **fusion-embedding-1-2b-preview v0.3** | 0.407 / 0.428 | **0.625 / 0.645** | **0.331 / 0.319** |
+| **fusion-embedding-1-2b-preview v0.3** | 0.407 / 0.428 | **0.625 / 0.645** | **0.331** / 0.319 |
 
 *ImageBind trains directly on audio–image pairs, so that pair is its supervised direction;
 its audio–text alignment is emergent. LanguageBind trains audio against language (its
@@ -95,7 +96,12 @@ branches fine-tune separate copies of the text tower, which diverge (mean captio
 0.55 between the audio and image branches' text embeddings) — the cross-branch binding
 weakens, which is consistent with its emergent audio↔image score. This model's shared
 space cannot drift by construction (the base is frozen; every training run asserts
-parameter-level identity).*
+parameter-level identity). Gemini Embedding 2 is Google's natively multimodal embedding
+API (text/image/video/audio in one space), evaluated at its documented default invocation
+(model id `gemini-embedding-2`, 3072-d native output, inline audio+image+text,
+google-genai 2.10.0) on the evaluation date shown; API models may change after that date.
+One shared caveat: the evaluation captions are model-generated, which could favor models
+whose text tower shares that caption style — all models received identical inputs.*
 
 Full audio→image metrics (per-modality mean-centered gallery — the readout implemented by
 `FusionEmbedder.center`; chance R@10 = 0.014):
