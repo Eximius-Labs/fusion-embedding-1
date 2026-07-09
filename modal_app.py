@@ -2910,7 +2910,8 @@ def rescore_qbnorm(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocap
                    task: str = "sound", dim: int = 0,
                    qb_shards: str = "audiocaps_train_full,laion_freesound_full",
                    qb_per_shard: int = 12, betas: str = "5,10,20,40",
-                   out_tag: str = "qb") -> dict:
+                   out_tag: str = "qb", caption_index: int = -1, caption_field: str = "",
+                   id_allowlist_file: str = "") -> dict:
     """T2A rescore with QB-Norm/DIS test-time hubness correction (Bogolin et al., CVPR
     2022) alongside the plain baseline. Querybank = cached TRAINING captions (never test):
     the first ``qb_per_shard`` txtemb shards from each source in ``qb_shards``, whitened +
@@ -2937,6 +2938,21 @@ def rescore_qbnorm(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocap
         index = json.load(fh)
     caps_multi = index["captions_multi"]
     d_audio = int(index["d_audio"])
+    # Protocol-variant selection — mirrors _score_816_protocol exactly (MECAT etc.).
+    if caption_field:
+        fld, par = caption_field.rsplit("_", 1)
+        caps_multi = [[str(c[fld][int(par)])] for c in index["captions_all"]]
+        print(f"caption_field={caption_field}: single-caption protocol")
+    elif caption_index >= 0:
+        caps_multi = [[c[caption_index]] for c in caps_multi]
+        print(f"caption_index={caption_index}: single-caption protocol")
+    clip_indices = list(range(len(caps_multi)))
+    if id_allowlist_file:
+        from fusion_embedding.train_stage1 import filter_clips_by_allowlist
+        with open(id_allowlist_file) as fh:
+            allow = set(json.load(fh))
+        clip_indices, caps_multi = filter_clips_by_allowlist(caps_multi, index["clip_ids"], allow)
+        print(f"allowlist: {len(clip_indices)} clips kept")
 
     ckpt_path = str(checkpoints_dir() / f"p1frames_{ckpt_shard}_step{steps}{run_tag}.pt")
     ckpt = torch.load(ckpt_path, map_location=dev)
@@ -2960,8 +2976,7 @@ def rescore_qbnorm(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocap
     # Eval audio pool + all reference captions (t2a queries) — native protocol.
     shard_paths = [str(fdir / s) for s in index["shards"]]
     starts = shard_starts_from(len(shard_paths), int(index["shard_size"]), index["n_total"])
-    eval_ds = InMemoryFrameDataset(load_frame_clips(shard_paths, starts,
-                                                    list(range(len(caps_multi)))))
+    eval_ds = InMemoryFrameDataset(load_frame_clips(shard_paths, starts, clip_indices))
     audio_emb, _ = encode_dataset(model, eval_ds, collator, dim=dim, device=dev)
     flat_caps, group_ids = flatten_caption_groups(caps_multi)
     instr = instruction_for(task)
