@@ -2639,6 +2639,125 @@ def _score_816_protocol(model, cfg, collator, eval_shard, *, device, dim=0, task
             "protocol": "min-rank-over-refs", **report}
 
 
+@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=2 * 3600,
+              memory=32768, env=HF_ENV)
+def uiq_eval(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocaps_train_full",
+             steps: int = 400, run_tag: str = "_v02_acft_400", load_in_4bit: bool = False,
+             task: str = "sound", dim: int = 0, uiq_prefix: str = "uiq/clotho",
+             query_types: str = "question,imperative,paraphrase,tagging",
+             limit_queries: int = 0, out_tag: str = "uiq") -> dict:
+    """UIQ robustness eval (User-Intent Queries; Yoo et al., ACL 2026, queries CC-BY-4.0):
+    text→audio retrieval with user-intent reformulations (question/imperative/paraphrase/
+    tagging) over OUR eval pool. SINGLE-POSITIVE protocol: each query targets exactly its
+    source clip (rank of the true clip among all pool clips); R@k = fraction of queries
+    whose true clip is in the top k. Query files live on the Volume at
+    ``{uiq_prefix}_{type}_queries.jsonl`` keyed by ``audio_id`` == the index ``clip_ids``
+    (Clotho: identical 1045-clip pool to the paper → directly comparable). Native-template
+    query encoding (same as rescore_816). Read-only except one result JSON."""
+    import dataclasses
+    import json
+
+    import torch
+
+    from fusion_embedding.config import FusionConfig
+    from fusion_embedding.data import (FrameCollator, InMemoryFrameDataset, instruction_for,
+                                       load_frame_clips, shard_starts_from)
+    from fusion_embedding.hf_components import load_base
+    from fusion_embedding.model import FusionEmbeddingModel, mrl_truncate_normalize
+    from fusion_embedding.paths import checkpoints_dir, frames_dir
+    from fusion_embedding.train_stage1 import encode_dataset
+
+    dev = "cuda"
+    fdir = frames_dir(eval_shard)
+    with open(str(fdir / "index.json")) as fh:
+        index = json.load(fh)
+    clip_ids = index.get("clip_ids")
+    if not clip_ids:
+        raise RuntimeError(f"{eval_shard} has no clip_ids — cannot join UIQ queries")
+    pos_of = {cid: i for i, cid in enumerate(clip_ids)}
+    d_audio = int(index["d_audio"])
+
+    ckpt_path = str(checkpoints_dir() / f"p1frames_{ckpt_shard}_step{steps}{run_tag}.pt")
+    ckpt = torch.load(ckpt_path, map_location=dev)
+    flds = {f.name for f in dataclasses.fields(FusionConfig)}
+    saved = {k: v for k, v in ckpt.get("config", {}).items() if k in flds}
+    cfg0 = FusionConfig(**{**saved, "d_audio": d_audio})
+    if "base_4bit" in ckpt and bool(ckpt["base_4bit"]) != bool(load_in_4bit):
+        print(f"WARNING: ckpt base_4bit={ckpt['base_4bit']} vs load_in_4bit={load_in_4bit} "
+              f"— precision mismatch corrupts scores (−5.6 incident)")
+    cfg, embed_tokens, base_lm, tokenizer = load_base(
+        cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit, d_audio=d_audio)
+    model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder=None)
+    model.resampler.to(dev).float()
+    model.resampler.load_state_dict(ckpt["resampler"])
+    if isinstance(model.logit_scale, torch.nn.Parameter):
+        model.logit_scale.data = ckpt["logit_scale"].to(dev)
+    if "text_whitening" in ckpt:
+        model.text_whitening.load_state_dict(ckpt["text_whitening"])
+    collator = FrameCollator(cfg, _HFTok(tokenizer, cfg))
+    dim = int(dim) or cfg.mrl_default
+
+    # Encode the FULL audio pool once (queries share it across types).
+    shard_paths = [str(fdir / s) for s in index["shards"]]
+    starts = shard_starts_from(len(shard_paths), int(index["shard_size"]), index["n_total"])
+    eval_ds = InMemoryFrameDataset(load_frame_clips(shard_paths, starts, list(range(len(clip_ids)))))
+    audio_emb, _ = encode_dataset(model, eval_ds, collator, dim=dim, device=dev)  # [n_clips, dim]
+    print(f"audio pool encoded: {tuple(audio_emb.shape)}")
+
+    instr = instruction_for(task)
+    hf_tok = getattr(collator.tokenizer, "hf", collator.tokenizer)
+    model.eval()
+
+    def _encode_queries(texts):
+        chunks, bs = [], 64
+        with torch.no_grad():
+            for i in range(0, len(texts), bs):
+                bodies = [f"<|im_start|>system\n{instr}<|im_end|>\n"
+                          f"<|im_start|>user\n{c}<|im_end|>\n"
+                          f"<|im_start|>assistant\n" for c in texts[i:i + bs]]
+                seqs = [hf_tok.encode(b, add_special_tokens=False)[:254] for b in bodies]
+                L = max(len(q) for q in seqs)
+                ids = torch.full((len(seqs), L), cfg.pad_id, dtype=torch.long)
+                mask = torch.zeros(len(seqs), L, dtype=torch.long)
+                for b, q in enumerate(seqs):
+                    ids[b, : len(q)] = torch.tensor(q)
+                    mask[b, : len(q)] = 1
+                raw = model.encode_text(ids.to(dev), mask.to(dev))
+                chunks.append(mrl_truncate_normalize(model.text_whitening(raw), dim).cpu())
+        return torch.cat(chunks)
+
+    per_type = {}
+    for qt in [q.strip() for q in query_types.split(",") if q.strip()]:
+        qpath = str(frames_dir("").parent / f"{uiq_prefix}_{qt}_queries.jsonl")
+        rows = [json.loads(ln) for ln in open(qpath, encoding="utf-8") if ln.strip()]
+        if limit_queries:
+            rows = rows[:limit_queries]
+        pairs = [(pos_of[r["audio_id"]], r["generated_query"]) for r in rows
+                 if r["audio_id"] in pos_of]
+        skipped = len(rows) - len(pairs)
+        true_idx = torch.tensor([p for p, _ in pairs])
+        q_emb = _encode_queries([q for _, q in pairs])
+        sim = q_emb @ audio_emb.t()                              # [n_q, n_clips]
+        true_sims = sim.gather(1, true_idx.unsqueeze(1))
+        ranks = (sim > true_sims).sum(dim=1) + 1                 # 1-based
+        rep = {f"R@{k}": round(float((ranks <= k).float().mean()), 4) for k in (1, 5, 10)}
+        rep["medR"] = float(ranks.median())
+        rep["n_queries"] = len(pairs); rep["skipped_unmatched"] = skipped
+        per_type[qt] = rep
+        print(f"UIQ {qt}: {rep}")
+
+    mean_r = {f"mean_R@{k}": round(sum(v[f"R@{k}"] for v in per_type.values()) / len(per_type), 4)
+              for k in (1, 5, 10)}
+    out = {"eval_shard": eval_shard, "ckpt": ckpt_path, "dim": dim, "protocol":
+           "UIQ single-positive t2a (Yoo et al. ACL 2026)", "per_type": per_type, **mean_r}
+    name = f"uiq{run_tag}_{out_tag}.json"
+    with open(str(checkpoints_dir() / name), "w") as fh:
+        json.dump(out, fh, indent=2)
+    volume.commit()
+    print("UIQ_EVAL:", json.dumps(mean_r))
+    return out
+
+
 @app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=3 * 3600,
               memory=32768, env=HF_ENV)
 def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audiocaps10k_post_proj",
