@@ -3885,6 +3885,161 @@ def languagebind_vggsound(dataset: str = "mteb/VGGSound_AV_RETRIEVAL", limit: in
     return out
 
 
+# Small CPU-only image for the Gemini Embedding 2 API baseline: no GPU frameworks beyond
+# CPU torch (needed only for retrieval_report), plus the decode stack shared with the other
+# VGGSound baselines. google-genai pinned; GEMINI_API_KEY comes from the Modal secret
+# `gemini-api-key` and must never be printed or logged.
+GENAI_SDK_VERSION = "2.10.0"
+gemini_embed_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg", "libsndfile1")
+    .pip_install("torch==2.6.0", extra_index_url="https://download.pytorch.org/whl/cpu")
+    .pip_install(f"google-genai=={GENAI_SDK_VERSION}", "datasets==3.2.0", "soundfile",
+                 "av>=12,<13", "pillow", "numpy<2")
+    .add_local_python_source("fusion_embedding")
+)
+
+
+@app.function(image=gemini_embed_image, secrets=[hf_secret, modal.Secret.from_name("gemini-api-key")],
+              volumes={VOL: volume}, cpu=4.0, memory=16384, timeout=2 * 3600, env=HF_ENV)
+def gemini_vggsound(dataset: str = "mteb/VGGSound_AV_RETRIEVAL", limit: int = 0,
+                    frame_index: int = 75) -> dict:
+    """API baseline: Google gemini-embedding-2 (natively multimodal, 3072-d unified space)
+    on OUR VGGSound-696 cross-modal protocol.
+
+    Same 696 pairs / frame_index=75 / captions / retrieval_report as imagebind_vggsound and
+    languagebind_vggsound. One embed_content call per pair with three separate
+    types.Content entries (inline WAV audio, inline JPEG frame, caption text) -> three
+    separate embeddings (documented behavior; audio inline is supported, WAV <=180s, so the
+    Files API is not needed). Default output_dimensionality (native 3072, auto-normalized;
+    truncation to 128-3072 exists but is not used). No documented per-model RPM for
+    gemini-embedding-2 (rate limits are AI Studio-only), so we self-pace at <=~200
+    requests/min and exponential-backoff on 429/5xx."""
+    import datetime as _dt
+    import io
+    import json
+    import time
+
+    import soundfile as sf
+    import torch
+
+    from fusion_embedding.train_stage1 import retrieval_report
+    from fusion_embedding.paths import checkpoints_dir
+
+    from google import genai
+    from google.genai import types as gtypes
+    from google.genai import errors as gerrors
+
+    MODEL_ID = "gemini-embedding-2"
+    client = genai.Client()  # reads GEMINI_API_KEY from the secret's env; never log it
+
+    import av as _av
+    from datasets import Audio as DAudio, Video as DVideo, load_dataset
+    ds = load_dataset(dataset, split="test", streaming=True)
+    ds = ds.cast_column("audio", DAudio(decode=False)).cast_column("video", DVideo(decode=False))
+
+    wav_bytes, jpg_bytes, captions = [], [], []
+    n_bad = 0
+    for i, row in enumerate(ds):
+        if limit and len(wav_bytes) >= limit:
+            break
+        try:
+            wav, sr0 = sf.read(io.BytesIO(row["audio"]["bytes"]), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            wbuf = io.BytesIO()
+            sf.write(wbuf, wav, sr0, format="WAV", subtype="PCM_16")
+            with _av.open(io.BytesIO(row["video"]["bytes"])) as c:
+                last = None
+                for j, fr in enumerate(c.decode(video=0)):
+                    last = fr
+                    if j == frame_index:
+                        break
+            if last is None:
+                n_bad += 1
+                continue
+            jbuf = io.BytesIO()
+            last.to_image().convert("RGB").save(jbuf, format="JPEG", quality=92)
+            wav_bytes.append(wbuf.getvalue())
+            jpg_bytes.append(jbuf.getvalue())
+            captions.append(str(row.get("audio_caption") or ""))
+        except Exception as e:                                     # noqa: BLE001
+            n_bad += 1
+            if n_bad <= 3:
+                print(f"decode fail {i}: {type(e).__name__}: {e}")
+    n = len(wav_bytes)
+    print(f"prepared {n} pairs ({n_bad} failed)")
+
+    def embed_pair(k):
+        """One API call -> (audio_vec, image_vec, text_vec) for pair k, with backoff."""
+        contents = [
+            gtypes.Content(parts=[gtypes.Part.from_bytes(data=wav_bytes[k], mime_type="audio/wav")]),
+            gtypes.Content(parts=[gtypes.Part.from_bytes(data=jpg_bytes[k], mime_type="image/jpeg")]),
+            gtypes.Content(parts=[gtypes.Part.from_text(text=captions[k])]),
+        ]
+        delay = 5.0
+        for attempt in range(10):
+            try:
+                res = client.models.embed_content(model=MODEL_ID, contents=contents)
+                if len(res.embeddings) != 3:
+                    raise RuntimeError(f"expected 3 embeddings, got {len(res.embeddings)}")
+                return [e.values for e in res.embeddings]
+            except gerrors.APIError as e:
+                if e.code in (429, 500, 502, 503, 504) and attempt < 9:
+                    print(f"pair {k}: HTTP {e.code}, retry in {delay:.0f}s "
+                          f"(attempt {attempt + 1})", flush=True)
+                    time.sleep(delay)
+                    delay = min(delay * 2, 120.0)
+                else:
+                    raise
+        raise RuntimeError("unreachable")
+
+    a_list, v_list, t_list = [], [], []
+    n_failures = 0
+    t0 = time.time()
+    for k in range(n):
+        try:
+            av_, iv_, tv_ = embed_pair(k)
+            a_list.append(av_)
+            v_list.append(iv_)
+            t_list.append(tv_)
+        except Exception as e:                                     # noqa: BLE001
+            n_failures += 1
+            print(f"pair {k} FAILED permanently: {type(e).__name__}: {getattr(e, 'code', '')}")
+        if k % 25 == 0:
+            print(f"  embedded {k + 1}/{n} pairs ({time.time() - t0:.0f}s)", flush=True)
+        time.sleep(0.3)  # self-pace ~<=200 requests/min
+    n_ok = len(a_list)
+    dim = len(a_list[0]) if n_ok else 0
+    print(f"embedded {n_ok}/{n} pairs, dim={dim}, {n_failures} API failures, "
+          f"{time.time() - t0:.0f}s")
+
+    a = torch.nn.functional.normalize(torch.tensor(a_list, dtype=torch.float32), dim=-1)
+    v = torch.nn.functional.normalize(torch.tensor(v_list, dtype=torch.float32), dim=-1)
+    t = torch.nn.functional.normalize(torch.tensor(t_list, dtype=torch.float32), dim=-1)
+    sims = a @ v.T
+    print(f"a@v sims: mean {sims.mean():.4f} std {sims.std():.4f} diag {sims.diag().mean():.4f}")
+
+    def _score(x, y):
+        return {k_: round(float(vv), 4) for k_, vv in retrieval_report(x, y).items()}
+
+    out = {"model": MODEL_ID, "sdk": f"google-genai=={GENAI_SDK_VERSION}",
+           "eval_date": _dt.date.today().isoformat(),
+           "dataset": dataset, "n_pairs": n_ok, "n_decode_failures": n_bad,
+           "n_api_failures": n_failures, "output_dimensionality": dim,
+           "audio_input": "inline WAV PCM_16 (native sr), one call per pair with 3 Content entries",
+           "chance_R@10": round(10.0 / max(n_ok, 1), 4),
+           "results": {"audio_vs_image": _score(a, v),
+                       "audio_vs_text": _score(a, t),
+                       "text_vs_image": _score(t, v)}}
+    if not limit:
+        with open(str(checkpoints_dir() / "gemini_embedding2_vggsound696.json"), "w") as fh:
+            json.dump(out, fh, indent=2)
+        volume.commit()
+    print("GEMINI:", json.dumps(out, indent=2))
+    return out
+
+
 @app.function(secrets=[hf_secret], volumes={VOL: volume}, cpu=8.0, memory=65536, timeout=3600, env=HF_ENV)
 def peek_vision() -> dict:
     """Phase 0 recon: how does the frozen Qwen3-VL-Embedding base want IMAGES fed to it?
