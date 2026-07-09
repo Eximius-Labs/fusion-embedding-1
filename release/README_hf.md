@@ -24,6 +24,10 @@ any direction between modalities.
 
 **Highlights**
 
+- **Leads every unified embedding model we measured on audio↔text.** On a single
+  cross-modal protocol, this model exceeds ImageBind, LanguageBind, and Gemini
+  Embedding 2 on audio↔text in both directions, and both language-bound baselines on
+  emergent audio↔image (full tables below).
 - **Unmodified base.** Only the connector is trained; the base model's parameters are
   byte-identical to the original release, so its text/image/video retrieval performance
   (MMEB-V2) carries over unchanged.
@@ -42,39 +46,30 @@ Earlier versions remain downloadable via the `v0.1-preview` and `v0.2-preview` t
 `v0.3-preview` pins the current version. All are compared below; pin a tag if you build
 on this model.
 
+## Architecture
+
+![Fusion Embedding architecture: frozen Qwen3-VL-Embedding-2B base and frozen Qwen2.5-Omni audio tower; only the FusionResampler is trained](assets/architecture.png)
+
+A perceiver-resampler (width 384, 64 latent queries) translates frozen audio-tower frames
+into the base model's input embedding space; its outputs occupy placeholder positions in
+the input stream, mirroring the base model's image-token mechanism. Training is
+contrastive (InfoNCE over the Matryoshka ladder, symmetric, with a full-corpus
+frozen-text negative bank — 484K captions at v0.2) against the base model's text
+embeddings in its native input format. v0.3 adds a second, connector-only fine-tuning
+stage on the AudioCaps train split (400 steps at a reduced learning rate), warm-started
+from the v0.2 checkpoint.
+
+**Input formatting.** All inputs use the base model's chat-template format (instruction in
+the system turn, content in the user turn, last-token pooling). Embedding quality is
+sensitive to this formatting; use the templates in `inference.py`. For cross-modal
+ranking, per-modality mean-centering of the gallery is recommended (`FusionEmbedder.center`).
+
 ## Evaluation
 
-**AudioCaps test** — 883 clips, five reference captions per clip, recall computed as
-min-rank over references:
+### Cross-modal retrieval — versus unified embedding models
 
-| Model | A→T R@1 | A→T R@10 | T→A R@10 |
-|---|---|---|---|
-| LAION-CLAP | 0.468 | 0.907 | 0.839 |
-| WavCaps HTSAT-BERT | 0.517 | 0.906 | 0.861 |
-| Cacophony | 0.553 | 0.924 | 0.864 |
-| M2D-CLAP | **0.593** | **0.928** | **0.886** |
-| fusion-embedding-1-2b-preview v0.1 | 0.216 | 0.626 | 0.680 |
-| fusion-embedding-1-2b-preview v0.2 | 0.279 | 0.717 | 0.736 |
-| **fusion-embedding-1-2b-preview v0.3** | 0.332 | 0.741 | 0.746 |
-
-*CLAP-family models fine-tune both encoders end-to-end and include AudioCaps and Clotho
-training data; this model keeps both towers frozen and trains only the connector.*
-
-**Clotho v2.1 evaluation** — 1,045 clips × 5 references, zero-shot (Clotho is excluded
-from training data):
-
-| Model | A→T R@10 | T→A R@10 |
-|---|---|---|
-| WavCaps CNN14-BERT (zero-shot) | **0.576** | **0.549** |
-| fusion-embedding-1-2b-preview v0.1 | 0.252 | 0.329 |
-| fusion-embedding-1-2b-preview v0.2 | 0.448 | 0.449 |
-| **fusion-embedding-1-2b-preview v0.3** | 0.433 | 0.460 |
-
-*v0.3's in-domain AudioCaps stage trades 1.5 points of zero-shot Clotho A→T for the
-AudioCaps gains above; T→A improves in both settings.*
-
-**Cross-modal retrieval** — VGGSound-AV, 696 audio/video-frame pairs (chance R@10 = 0.014).
-R@10 shown as audio-side → other / other → audio-side:
+VGGSound-AV, 696 audio/video-frame pairs (chance R@10 = 0.014). R@10 shown as
+audio-side → other / other → audio-side:
 
 | Model | audio↔image | audio↔text | text↔image |
 |---|---|---|---|
@@ -145,32 +140,47 @@ results are the correct sound category:
 | Bird chirps and tweets | songbirds, owls, a cawing crow | rank 18 |
 | A power-tool whirring | drills and small motors | rank 32 |
 
-**MAEB (beta).** On 10 tasks of the MTEB team's Massive Audio Embedding Benchmark
+### MAEB (beta)
+
+On 10 tasks of the MTEB team's Massive Audio Embedding Benchmark
 (mteb 2.18.0, v0.2 checkpoint; ranks vs the live leaderboard as of 2026-07-09, 21–65
 models per task): UrbanSound8K T2A retrieval #3, Ravdess zero-shot #4, FSD2019Kaggle #6,
 BeijingOpera #6, with mid-field placements on speech/music tasks the model was never
 trained for. Official leaderboard submission in progress.
 
+### Audio–text retrieval — versus specialist CLAP models
+
+**AudioCaps test** — 883 clips, five reference captions per clip, recall computed as
+min-rank over references:
+
+| Model | A→T R@1 | A→T R@10 | T→A R@10 |
+|---|---|---|---|
+| LAION-CLAP | 0.468 | 0.907 | 0.839 |
+| WavCaps HTSAT-BERT | 0.517 | 0.906 | 0.861 |
+| Cacophony | 0.553 | 0.924 | 0.864 |
+| M2D-CLAP | **0.593** | **0.928** | **0.886** |
+| fusion-embedding-1-2b-preview v0.1 | 0.216 | 0.626 | 0.680 |
+| fusion-embedding-1-2b-preview v0.2 | 0.279 | 0.717 | 0.736 |
+| **fusion-embedding-1-2b-preview v0.3** | 0.332 | 0.741 | 0.746 |
+
+*CLAP-family models fine-tune both encoders end-to-end and include AudioCaps and Clotho
+training data; this model keeps both towers frozen and trains only the connector.*
+
+**Clotho v2.1 evaluation** — 1,045 clips × 5 references, zero-shot (Clotho is excluded
+from training data):
+
+| Model | A→T R@10 | T→A R@10 |
+|---|---|---|
+| WavCaps CNN14-BERT (zero-shot) | **0.576** | **0.549** |
+| fusion-embedding-1-2b-preview v0.1 | 0.252 | 0.329 |
+| fusion-embedding-1-2b-preview v0.2 | 0.448 | 0.449 |
+| **fusion-embedding-1-2b-preview v0.3** | 0.433 | 0.460 |
+
+*v0.3's in-domain AudioCaps stage trades 1.5 points of zero-shot Clotho A→T for the
+AudioCaps gains above; T→A improves in both settings.*
+
 Text, image, and video benchmarks are the base model's published MMEB-V2 results, which
 are unaffected by this extension.
-
-## Architecture
-
-![Fusion Embedding architecture: frozen Qwen3-VL-Embedding-2B base and frozen Qwen2.5-Omni audio tower; only the FusionResampler is trained](assets/architecture.png)
-
-A perceiver-resampler (width 384, 64 latent queries) translates frozen audio-tower frames
-into the base model's input embedding space; its outputs occupy placeholder positions in
-the input stream, mirroring the base model's image-token mechanism. Training is
-contrastive (InfoNCE over the Matryoshka ladder, symmetric, with a full-corpus
-frozen-text negative bank — 484K captions at v0.2) against the base model's text
-embeddings in its native input format. v0.3 adds a second, connector-only fine-tuning
-stage on the AudioCaps train split (400 steps at a reduced learning rate), warm-started
-from the v0.2 checkpoint.
-
-**Input formatting.** All inputs use the base model's chat-template format (instruction in
-the system turn, content in the user turn, last-token pooling). Embedding quality is
-sensitive to this formatting; use the templates in `inference.py`. For cross-modal
-ranking, per-modality mean-centering of the gallery is recommended (`FusionEmbedder.center`).
 
 ## Usage
 
