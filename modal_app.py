@@ -55,9 +55,17 @@ image = (
         "av>=12.0",                                    # Phase 0: video-frame extraction for AV pairs
         extra_index_url="https://download.pytorch.org/whl/cu124",
     )
-    # Ship the local package into the image so `import fusion_embedding` works in the container.
-    .add_local_python_source("fusion_embedding")
 )
+
+# MAEB runs need mteb on top of the training deps (separate image so the trainer image
+# stays untouched); local files must be added LAST on each derived image.
+maeb_image = (image.pip_install("torch==2.7.1", "torchvision==0.22.1", "torchaudio==2.7.1",
+                                "torchcodec==0.5", "mteb==2.18.0")
+              .add_local_python_source("fusion_embedding")
+              .add_local_file("release/mteb_wrapper.py", "/root/mteb_wrapper.py"))
+
+# Ship the local package into the image so `import fusion_embedding` works in the container.
+image = image.add_local_python_source("fusion_embedding")
 
 app = modal.App(APP_NAME, image=image)
 
@@ -2901,6 +2909,59 @@ def uiq_eval(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocaps_trai
     volume.commit()
     print("UIQ_EVAL:", json.dumps(mean_r))
     return out
+
+
+@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=8 * 3600,
+              memory=65536, cpu=8.0, env=HF_ENV, image=maeb_image)
+def maeb_eval(ckpt_name: str = ("p1frames_audiocaps_train_full,fsd50k_train,"
+                                "wavcaps_audioset_sl_full,laion_freesound_full"
+                                "_step3200_d500k_full_384_3200.pt"),
+              tasks: str = "BeijingOpera", dim: int = 0, audio_batch: int = 8,
+              out_tag: str = "maeb") -> dict:
+    """Run MAEB(beta) tasks through the mteb harness with our released-checkpoint wrapper.
+
+    ``tasks`` is a comma list of MAEB task names (see the benchmark enumeration in
+    docs/progress.md). Results JSONs land in checkpoints/maeb_{out_tag}/ on the Volume —
+    the same files the mteb results-repo PR wants. Read-only w.r.t. training data."""
+    import json
+    import os
+    import sys
+
+    sys.path.insert(0, "/root")
+    import mteb
+    from mteb_wrapper import load_for_mteb
+
+    from fusion_embedding.paths import checkpoints_dir
+
+    wanted = {t.strip() for t in tasks.split(",") if t.strip()}
+    bench = mteb.get_benchmark("MAEB(beta)")
+    task_objs = [t for t in bench.tasks if t.metadata.name in wanted]
+    missing = wanted - {t.metadata.name for t in task_objs}
+    if missing:
+        raise ValueError(f"unknown MAEB tasks: {sorted(missing)}")
+    print(f"running {len(task_objs)} tasks: {[t.metadata.name for t in task_objs]}")
+
+    model = load_for_mteb(ckpt_name, device="cuda", dim=dim)
+    model.audio_batch = int(audio_batch)
+    out_dir = str(checkpoints_dir() / f"maeb_{out_tag}")
+    os.makedirs(out_dir, exist_ok=True)
+    res = mteb.evaluate(model, tasks=task_objs, prediction_folder=None,
+                        cache=mteb.ResultCache(cache_path=out_dir) if hasattr(mteb, "ResultCache") else None,
+                        raise_error=False)
+    summary = {}
+    for tr in getattr(res, "task_results", res if isinstance(res, list) else []):
+        try:
+            name = tr.task_name
+            summary[name] = {s: v for s, v in (tr.only_main_score().scores or {}).items()} \
+                if hasattr(tr, "only_main_score") else str(tr)[:200]
+        except Exception as e:                                     # noqa: BLE001
+            summary[str(tr)[:60]] = f"parse-err {e}"
+    with open(os.path.join(out_dir, "summary.json"), "w") as fh:
+        json.dump({"tasks": sorted(wanted), "ckpt": ckpt_name, "summary": summary}, fh,
+                  indent=2, default=str)
+    volume.commit()
+    print("MAEB_EVAL:", json.dumps(summary, default=str)[:1500])
+    return {"tasks": sorted(wanted), "out_dir": out_dir, "summary": summary}
 
 
 @app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=2 * 3600,

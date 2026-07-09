@@ -38,10 +38,27 @@ class FusionEmbeddingMTEB:
         self.text_batch = text_batch
 
     # ---- mteb interface -------------------------------------------------------
+    def encode(self, inputs, *, task_metadata=None, hf_split=None, hf_subset=None,
+               prompt_type=None, **kwargs: Any) -> np.ndarray:
+        """mteb EncoderProtocol entry point — dispatch by the batch's modality columns
+        (mirrors the ClapZeroShotWrapper dispatcher; audio+text fusion unsupported)."""
+        feats = inputs.dataset.features
+        has_text, has_audio = "text" in feats, "audio" in feats
+        if has_text and has_audio:
+            raise NotImplementedError("fusion-embedding-1 encodes one modality per input")
+        if has_audio:
+            return self.get_audio_embeddings(inputs, **kwargs)
+        if has_text:
+            return self.get_text_embeddings(inputs, **kwargs)
+        raise ValueError(f"no supported modality in {list(feats)}")
+
     def get_audio_embeddings(self, inputs, show_progress_bar: bool = True,
                              **kwargs: Any) -> np.ndarray:
+        from mteb.models.modality_collators import AudioCollator
+
         from fusion_embedding.model import mrl_truncate_normalize
 
+        inputs.collate_fn = AudioCollator(target_sampling_rate=SAMPLING_RATE)
         out = []
         self.model.eval()
         buf: list = []
@@ -118,6 +135,37 @@ class FusionEmbeddingMTEB:
     def similarity(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
         return a @ b.T
 
+    def similarity_pairwise(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        return (np.asarray(a) * np.asarray(b)).sum(axis=-1)
+
+
+def build_model_meta(revision: str = "v0.2-preview"):
+    """ModelMeta for mteb — declares modalities/params; also the leaderboard-PR entry."""
+    from mteb.models import ModelMeta
+
+    return ModelMeta(
+        loader=None,
+        name="EximiusLabs/fusion-embedding-1-2b-preview",
+        languages=["eng-Latn"],
+        revision=revision,
+        release_date="2026-07-06",
+        modalities=["audio", "text"],
+        n_parameters=2_200_000_000,
+        n_embedding_parameters=16_400_000,
+        memory_usage_mb=14000,
+        max_tokens=254,
+        embed_dim=2048,
+        license="cc-by-nc-4.0",
+        open_weights=True,
+        public_training_code="https://github.com/Eximius-Labs/fusion-embedding-1",
+        public_training_data=None,
+        framework=["PyTorch"],
+        reference="https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview",
+        similarity_fn_name="cosine",
+        use_instructions=True,
+        training_datasets=set(),
+    )
+
 
 def load_for_mteb(ckpt_name: str, device: str = "cuda", dim: int = 0):
     """Build FusionEmbeddingMTEB from a training checkpoint on the Volume (Modal-side)."""
@@ -145,4 +193,9 @@ def load_for_mteb(ckpt_name: str, device: str = "cuda", dim: int = 0):
     if "text_whitening" in ckpt:
         model.text_whitening.load_state_dict(ckpt["text_whitening"])
     hf_tok = getattr(tokenizer, "hf", tokenizer)
-    return FusionEmbeddingMTEB(model, cfg, fe, hf_tok, device=device, dim=dim)
+    wrapper = FusionEmbeddingMTEB(model, cfg, fe, hf_tok, device=device, dim=dim)
+    try:
+        wrapper.mteb_model_meta = build_model_meta()
+    except Exception as e:                                         # noqa: BLE001
+        print(f"ModelMeta attach skipped: {e}")
+    return wrapper
