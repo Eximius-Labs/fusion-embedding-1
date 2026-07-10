@@ -15,6 +15,15 @@ base_model: Qwen/Qwen3-VL-Embedding-2B
 
 # fusion-embedding-1-2b-preview
 
+<div align="center">
+
+**One model. One vector space. Text, image, video, audio — and PDF.**
+
+*An open-weight multimodal embedding model that extends a state-of-the-art
+vision-language embedding base with audio — without modifying a single base weight.*
+
+</div>
+
 Fusion Embedding 1 extends [Qwen3-VL-Embedding-2B](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B)
 with an audio modality. A trained connector (~16M parameters) maps frozen
 [Qwen2.5-Omni](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) audio-tower features into the
