@@ -54,6 +54,9 @@ any direction between modalities.
   64} dimensions with renormalization.
 - **Compact distribution.** This repository ships the connector and normalization
   statistics (~60 MB); the frozen towers are downloaded from their original repositories.
+  The parameter count shown for this repository (16.4M) is the trained connector —
+  `model.safetensors` and the `.pt` checkpoint contain the same weights; `inference.py`
+  loads the `.pt`.
 
 This is a **research preview**, currently at **v0.3**: the v0.2 contrastive stage (484K
 pairs) followed by a connector-only in-domain fine-tune on the AudioCaps train split.
