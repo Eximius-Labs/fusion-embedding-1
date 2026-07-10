@@ -62,7 +62,9 @@ image = (
 maeb_image = (image.pip_install("torch==2.7.1", "torchvision==0.22.1", "torchaudio==2.7.1",
                                 "torchcodec==0.5", "mteb==2.18.0")
               .add_local_python_source("fusion_embedding")
-              .add_local_file("release/mteb_wrapper.py", "/root/mteb_wrapper.py"))
+              .add_local_file("release/mteb_wrapper.py", "/root/mteb_wrapper.py")
+              .add_local_file("submission/fusion_embedding_models.py",
+                              "/root/fusion_embedding_models.py"))
 
 # Ship the local package into the image so `import fusion_embedding` works in the container.
 image = image.add_local_python_source("fusion_embedding")
@@ -2917,7 +2919,7 @@ def maeb_eval(ckpt_name: str = ("p1frames_audiocaps_train_full,fsd50k_train,"
                                 "wavcaps_audioset_sl_full,laion_freesound_full"
                                 "_step3200_d500k_full_384_3200.pt"),
               tasks: str = "BeijingOpera", dim: int = 0, audio_batch: int = 8,
-              out_tag: str = "maeb") -> dict:
+              out_tag: str = "maeb", hub_wrapper_revision: str = "") -> dict:
     """Run MAEB(beta) tasks through the mteb harness with our released-checkpoint wrapper.
 
     ``tasks`` is a comma list of MAEB task names (see the benchmark enumeration in
@@ -2941,7 +2943,16 @@ def maeb_eval(ckpt_name: str = ("p1frames_audiocaps_train_full,fsd50k_train,"
         raise ValueError(f"unknown MAEB tasks: {sorted(missing)}")
     print(f"running {len(task_objs)} tasks: {[t.metadata.name for t in task_objs]}")
 
-    model = load_for_mteb(ckpt_name, device="cuda", dim=dim)
+    if hub_wrapper_revision:
+        # Exercise the EXACT mteb-PR code path: the submission wrapper's
+        # (model_name, revision) constructor, loading the released ckpt from the HF Hub.
+        from fusion_embedding_models import FusionEmbeddingWrapper
+        model = FusionEmbeddingWrapper("EximiusLabs/fusion-embedding-1-2b-preview",
+                                       revision=hub_wrapper_revision, device="cuda")
+        from mteb_wrapper import build_model_meta
+        model.mteb_model_meta = build_model_meta(hub_wrapper_revision)
+    else:
+        model = load_for_mteb(ckpt_name, device="cuda", dim=dim)
     model.audio_batch = int(audio_batch)
     out_dir = str(checkpoints_dir() / f"maeb_{out_tag}")
     os.makedirs(out_dir, exist_ok=True)
