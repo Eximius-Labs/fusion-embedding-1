@@ -1,6 +1,6 @@
 <div align="center">
 
-# Fusion Embedding
+![Fusion Embedding 1 — 2B Preview, by Eximius Labs](assets/banner.png)
 
 **One model. One vector space. Text, image, video, audio — and PDF.**
 
@@ -9,7 +9,7 @@ vision-language embedding base with audio — without modifying a single base we
 
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](#)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](#)
-[![License](https://img.shields.io/badge/license-Apache--2.0%20(target)-green.svg)](#license)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-research%20preview-orange.svg)](#roadmap)
 
 </div>
@@ -390,8 +390,9 @@ fully testable without hardware.
 
 ## License
 
-Code: **Apache-2.0** (target). Model weights: the release tier will ship under
-a permissive license pending a license audit of the frozen audio tower and the
+Code: **[Apache-2.0](LICENSE)**. Model weights: the current previews are
+**CC-BY-NC-4.0** (research); the release tier will ship under a permissive
+license pending a license audit of the frozen audio tower and the
 training-data track used (research-posture vs commercially-clean corpora are
 kept strictly separate).
 
