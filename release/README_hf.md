@@ -13,7 +13,7 @@ tags:
 base_model: Qwen/Qwen3-VL-Embedding-2B
 ---
 
-# fusion-embedding-1-2b-preview
+![Fusion Embedding 1 — 2B Preview, by Eximius Labs](assets/banner.png)
 
 <div align="center">
 
