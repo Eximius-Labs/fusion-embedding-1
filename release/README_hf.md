@@ -22,6 +22,12 @@ base_model: Qwen/Qwen3-VL-Embedding-2B
 *An open-weight multimodal embedding model that extends a state-of-the-art
 vision-language embedding base with audio — without modifying a single base weight.*
 
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://github.com/Eximius-Labs/fusion-embedding-1)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://github.com/Eximius-Labs/fusion-embedding-1)
+[![Weights](https://img.shields.io/badge/weights-CC--BY--NC--4.0-green.svg)](#training-data-and-license)
+[![Status](https://img.shields.io/badge/status-research%20preview%20v0.3-orange.svg)](#)
+[![Code](https://img.shields.io/badge/code-GitHub-black.svg)](https://github.com/Eximius-Labs/fusion-embedding-1)
+
 </div>
 
 Fusion Embedding 1 extends [Qwen3-VL-Embedding-2B](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B)
