@@ -310,10 +310,12 @@ The strongest placements are environmental-sound tasks — the category the MAEB
 identifies as contrastive audio-text models' strength — achieved with 16.4M trained
 parameters and no music or speech training. Reproduce with `modal_app.py::maeb_eval`.
 
-¹ FSDKaggle2019's test filenames are competition-anonymized, so clip-level disjointness
-from FSD50K (in our training corpus, same Freesound source pool) cannot be verified;
-this score is disclosed here but withheld from the official leaderboard submission.
-All other tasks' data is verifiably disjoint from training.
+¹ Verified by Freesound id (Zenodo post-competition metadata): 608 of FSDKaggle2019's
+4,481 test clips (13.6%) appear in the FSD50K dev split, which is in our training
+corpus — so this score is disclosed here but withheld from the official leaderboard
+submission. The full FSDKaggle2019 test set is contained in FSD50K (dev+eval), which
+likely affects other FSD50K-trained models on this task. All other tasks' data is
+verifiably disjoint from training.
 
 **Inference-time option.** `modal_app.py::rescore_qbnorm` adds
 [QB-Norm](https://arxiv.org/abs/2112.12777) (CVPR 2022) test-time hubness correction with

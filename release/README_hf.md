@@ -145,10 +145,10 @@ results are the correct sound category:
 On 10 tasks of the MTEB team's Massive Audio Embedding Benchmark
 (mteb 2.18.0, v0.2 checkpoint; ranks vs the live leaderboard as of 2026-07-09, 21–65
 models per task): UrbanSound8K T2A retrieval #3, Ravdess zero-shot #4, FSD2019Kaggle #6
-(disclosed only — its anonymized test filenames make disjointness from FSD50K training
-data unverifiable, so it is withheld from the official submission), BeijingOpera #6,
-with mid-field placements on speech/music tasks the model was never trained for.
-Official leaderboard submission in progress.
+(disclosed only — 13.6% of its test clips appear in the FSD50K dev split used in
+training, verified by Freesound id, so it is withheld from the official submission),
+BeijingOpera #6, with mid-field placements on speech/music tasks the model was never
+trained for. Official leaderboard submission in progress.
 
 ### Audio–text retrieval — versus specialist CLAP models
 
