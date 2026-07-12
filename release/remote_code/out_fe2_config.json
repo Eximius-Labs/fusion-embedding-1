@@ -1,0 +1,76 @@
+{
+  "model_type": "fusion-embedding-connector",
+  "adapter_rank": 384,
+  "d_resampler": 384,
+  "n_query": 64,
+  "d_llm": 2048,
+  "mrl_dims": [
+    2048,
+    1536,
+    1024,
+    512,
+    256,
+    128,
+    64
+  ],
+  "trained_params": 60552832,
+  "protocol": {
+    "text_query_template": "<|im_start|>system\n{instruction}<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n",
+    "image_doc_template": "<|im_start|>system\nRepresent the user's input.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n",
+    "default_query_instruction": "Retrieve images or text relevant to the user's query.",
+    "pooling": "last non-pad token",
+    "cross_modal_readout": "per-modality mean-centering recommended (see inference.center)"
+  },
+  "benchmarks": {
+    "audiocaps_883_minrank5": {
+      "ckpt_shard": "audiocaps_train_full",
+      "steps": 400,
+      "run_tag": "_v05b_acft_400",
+      "text_whitening_fitted": 1,
+      "eval_shard": "audiocaps_test816",
+      "n_clips": 883,
+      "n_captions": 4411,
+      "dim": 1024,
+      "n_total_clips": 883,
+      "split_filtered": false,
+      "caption_index": -1,
+      "caption_field": "",
+      "protocol": "min-rank-over-refs",
+      "a2t_R@1": 0.30237826704978943,
+      "a2t_R@5": 0.5877689719200134,
+      "a2t_R@10": 0.7429218292236328,
+      "a2t_mAP@10": 0.22937935590744019,
+      "t2a_R@1": 0.2922239899635315,
+      "t2a_R@5": 0.635003387928009,
+      "t2a_R@10": 0.7746542692184448,
+      "t2a_mAP@10": 0.4378591477870941
+    },
+    "in_domain_eval": {
+      "a2t_R@1": 0.42500001192092896,
+      "a2t_R@10": 0.8849999904632568,
+      "a2t_mAP@10": 0.587212324142456
+    }
+  },
+  "d_audio": 3584,
+  "resampler_depth": 6,
+  "resampler_heads": 8,
+  "resampler_ffn_mult": 4,
+  "resampler_dropout": 0.0,
+  "adapter_act": "silu",
+  "mrl_default": 1024,
+  "audio_pad_id": 151654,
+  "eos_id": 151645,
+  "pad_id": 151643,
+  "audio_pad_token": "<|audio_pad|>",
+  "base_model": "Qwen/Qwen3-VL-Embedding-2B",
+  "audio_model": "Qwen/Qwen2.5-Omni-7B",
+  "max_text_tokens": 512,
+  "n_decoder_layers": 28,
+  "architectures": [
+    "FusionEmbeddingModel"
+  ],
+  "auto_map": {
+    "AutoConfig": "configuration_fusion_embedding.FusionEmbeddingConfig",
+    "AutoModel": "modeling_fusion_embedding.FusionEmbeddingModel"
+  }
+}

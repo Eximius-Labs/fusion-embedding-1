@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fusion-embedding"
 version = "0.1.0"
-description = "Fusion Embedding 1 — graft an audio pathway onto a frozen Qwen3-VL-Embedding base."
+description = "Fusion Embedding — audio pathway for a frozen Qwen3-VL-Embedding base (one space for text, image, video, audio)."
 authors = [{ name = "Abdul Basit Tonmoy" }]
 requires-python = ">=3.10"
 dependencies = [
