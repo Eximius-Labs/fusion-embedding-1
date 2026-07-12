@@ -11,8 +11,8 @@ from fusion_embedding.config import FusionConfig
 from fusion_embedding.model import FusionEmbeddingModel
 from fusion_embedding.data import (
     CachedFrameDataset, FrameCollator, HashingTokenizer,
-    ShardedFrameDataset, load_frame_clips, shard_starts_from, write_frame_shard,
-    text_emb_shard_path, write_text_emb_shard,
+    ShardedFrameDataset, cumulative_starts, load_frame_clips, load_recaption,
+    shard_starts_from, write_frame_shard, text_emb_shard_path, write_text_emb_shard,
 )
 from fusion_embedding._tiny import build_tiny_model, build_tiny_components, TINY_VOCAB
 
@@ -139,6 +139,76 @@ def test_sharded_dataset_yields_all_nonexcluded_once():
     expected = {f"sound number {i}" for i in range(25)} - {f"sound number {i}" for i in exclude}
     assert set(seen) == expected and len(seen) == len(expected)          # each non-excluded exactly once
     assert all(set(it) == {"frames", "text", "task", "instruction"} for it in ds)  # collator-ready
+
+
+def test_sharded_dataset_captions_override_and_skip_exclusion():
+    """Leg B recaption path: overridden global indices yield the NEW caption, SKIP indices
+    (routed into ``exclude``) never appear, everything else keeps its original text."""
+    cfg = FusionConfig.tiny()
+    d = tempfile.mkdtemp()
+    _write_shards(cfg, n=25, shard_size=10, dir_=d)
+    paths = sorted(os.path.join(d, f) for f in os.listdir(d) if f.startswith("shard-"))
+    starts = shard_starts_from(len(paths), shard_size=10, n_total=25)
+    override = {3: "a dog barks", 11: "rain falls on a roof", 24: "a bell rings"}
+    skip = {0, 12}
+    ds = ShardedFrameDataset(paths, starts, exclude=skip, shuffle_buffer=4, seed=1,
+                             captions_override=override)
+    seen = {it["text"] for it in ds}
+    assert {"a dog barks", "rain falls on a roof", "a bell rings"} <= seen   # overrides applied
+    assert not {f"sound number {i}" for i in override} & seen               # originals replaced
+    assert not {f"sound number {i}" for i in skip} & seen                   # SKIPs dropped
+    assert len(seen) == 23                                                  # 25 - 2 skipped
+
+
+def test_load_frame_clips_applies_captions_override():
+    cfg = FusionConfig.tiny()
+    d = tempfile.mkdtemp()
+    _write_shards(cfg, n=25, shard_size=10, dir_=d)
+    paths = sorted(os.path.join(d, f) for f in os.listdir(d) if f.startswith("shard-"))
+    starts = shard_starts_from(len(paths), shard_size=10, n_total=25)
+    clips = load_frame_clips(paths, starts, [2, 13, 20],
+                             captions_override={13: "waves crash on a shore"})
+    assert [c["text"] for c in clips] == ["sound number 2", "waves crash on a shore",
+                                          "sound number 20"]
+
+
+def test_captions_override_aligns_on_varying_shard_sizes():
+    """Regression for the 2026-07-10 miswrite: webdataset shards VARY in size (one per source
+    tar, 515–527 observed), so global offsets MUST come from cumulative actual lengths — the
+    uniform p*shard_size formula drifts and pairs overrides with the wrong clips."""
+    cfg = FusionConfig.tiny()
+    d = tempfile.mkdtemp()
+    sizes = [7, 5, 9, 4]                                       # deliberately non-uniform
+    g = torch.Generator().manual_seed(0)
+    recs = [{"frames": torch.randn(3 + i % 5, cfg.d_audio, generator=g),
+             "text": f"sound number {i}", "task": "sound"} for i in range(sum(sizes))]
+    paths, at = [], 0
+    for s, n in enumerate(sizes):
+        p = os.path.join(d, f"shard-{s:03d}.pt")
+        write_frame_shard(p, recs[at:at + n], half=True)
+        paths.append(p); at += n
+    starts = cumulative_starts(sizes)
+    assert starts == [0, 7, 12, 21]
+    # Override the FIRST clip of each shard by its true global index; with uniform-512-style
+    # starts these land inside the wrong shard.
+    override = {0: "override A", 7: "override B", 12: "override C", 21: "override D"}
+    ds = ShardedFrameDataset(paths, starts, shuffle_buffer=2, seed=3,
+                             captions_override=override)
+    seen = {it["text"] for it in ds}
+    assert {"override A", "override B", "override C", "override D"} <= seen
+    assert not {"sound number 0", "sound number 7", "sound number 12", "sound number 21"} & seen
+    clips = load_frame_clips(paths, starts, [7, 21], captions_override=override)
+    assert [c["text"] for c in clips] == ["override B", "override D"]
+
+
+def test_load_recaption_splits_skip_and_offsets(tmp_path):
+    import json
+    rp = tmp_path / "src.json"
+    rp.write_text(json.dumps({"0": "a horn honks", "1": "SKIP", "2": " skip ",
+                              "3": "wind blows through trees"}), encoding="utf-8")
+    override, skip = load_recaption(rp, src_base=100)
+    assert override == {100: "a horn honks", 103: "wind blows through trees"}
+    assert skip == {101, 102}                                # SKIP matching is trim+case-insensitive
 
 
 def test_sharded_dataset_reiterates_full_epochs_and_collates():

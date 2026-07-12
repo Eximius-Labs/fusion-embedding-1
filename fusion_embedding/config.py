@@ -51,6 +51,14 @@ class FusionConfig:
     resampler_ffn_mult: int = 4  # FFN expansion (4x)
     resampler_dropout: float = 0.0
 
+    # --- Modality-gated deep adapters (v0.5 experiment; docs/adapter_experiment_plan.md) ---
+    # Per-decoder-layer bottleneck adapters gated to AUDIO forwards only: text/image/video
+    # encodes execute the identical frozen graph (the hook returns untouched output before
+    # any arithmetic), so the byte-frozen shared-space guarantee is preserved exactly.
+    # 0 = off (no hooks registered; every existing entrypoint unchanged).
+    adapter_rank: int = 0
+    adapter_act: str = "silu"
+
     # --- Matryoshka ladder (HLD §3) ---
     mrl_dims: tuple[int, ...] = (2048, 1536, 1024, 512, 256, 128, 64)
     mrl_default: int = 1024

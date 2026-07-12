@@ -66,7 +66,7 @@ on this model.
 
 ## Architecture
 
-![Fusion Embedding architecture: frozen Qwen3-VL-Embedding-2B base and frozen Qwen2.5-Omni audio tower; only the FusionResampler is trained](assets/architecture.png)
+![fusion-embedding-1 model overview: audio through the frozen Qwen2.5-Omni tower and the trained FusionResampler into the byte-frozen Qwen3-VL-Embedding-2B layer stack, then last-token pooling and Matryoshka truncation into one shared embedding space](assets/fe1_model_overview.png)
 
 A perceiver-resampler (width 384, 64 latent queries) translates frozen audio-tower frames
 into the base model's input embedding space; its outputs occupy placeholder positions in
@@ -85,6 +85,10 @@ ranking, per-modality mean-centering of the gallery is recommended (`FusionEmbed
 ## Evaluation
 
 ### Cross-modal retrieval — versus unified embedding models
+
+<p align="center">
+<img src="assets/fe_positioning.png" alt="Positioning: VGGSound-696 cross-modal retrieval versus model parameters; the fusion-embedding family leads unified models on audio-text and leads the emergent audio-image cluster (ImageBind's supervised pair annotated)" width="860px">
+</p>
 
 VGGSound-AV, 696 audio/video-frame pairs (chance R@10 = 0.014). R@10 shown as
 audio-side → other / other → audio-side:

@@ -72,7 +72,18 @@ class TinyLM(nn.Module):
 
     def forward(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         key_padding = attention_mask == 0
-        return self.body(inputs_embeds, src_key_padding_mask=key_padding)
+        # Pin to the standard (non-fused) attention path: nn.TransformerEncoder silently
+        # switches to a fused fast path under eval+no_grad UNLESS layer hooks exist, which
+        # would make hook-bearing and hook-free stand-ins numerically differ for kernel
+        # reasons unrelated to the architecture under test (adapter bitwise-invariance
+        # tests need path parity; the real HF base has no hook-conditional kernels).
+        import torch.backends.mha as _mha
+        prev = _mha.get_fastpath_enabled()
+        _mha.set_fastpath_enabled(False)
+        try:
+            return self.body(inputs_embeds, src_key_padding_mask=key_padding)
+        finally:
+            _mha.set_fastpath_enabled(prev)
 
 
 def build_tiny_components(cfg: FusionConfig, vocab: int = TINY_VOCAB):

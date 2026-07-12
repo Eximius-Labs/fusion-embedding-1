@@ -66,8 +66,22 @@ maeb_image = (image.pip_install("torch==2.7.1", "torchvision==0.22.1", "torchaud
               .add_local_file("submission/fusion_embedding_models.py",
                               "/root/fusion_embedding_models.py"))
 
+# Stage A tower probe (2026-07-10): alternate frozen audio towers. GLAP's controlled ablation
+# (arXiv:2506.11350 Tab.4) shows Whisper-family encoders (our Qwen2.5-Omni tower's family) trail
+# sound-event encoders by ~10 mAP@10 on AudioCaps T2A; Dasheng is their production pick.
+# Separate derived image so the base trainer image is untouched.
+# torchaudio must ABI-pair with the base image's torch==2.6.0 cu124 (torch/torchcodec
+# pairing trap, 2026-07-08) — same extra index so pip resolves the cu124 wheel.
+alt_tower_image = (image.pip_install("dasheng==0.0.9", "torchaudio==2.6.0",
+                                     extra_index_url="https://download.pytorch.org/whl/cu124")
+                   .add_local_python_source("fusion_embedding"))
+
 # Ship the local package into the image so `import fusion_embedding` works in the container.
 image = image.add_local_python_source("fusion_embedding")
+
+# FE2 hub-smoke image: the released inference.py rides along so the smoke exercises the
+# EXACT artifact users run (loaded from the public HF repo, not the local checkout).
+fe2_smoke_image = image.add_local_file("fe2_release/inference.py", "/root/fe2_inference.py")
 
 app = modal.App(APP_NAME, image=image)
 
@@ -1006,12 +1020,13 @@ def ingest_mecat_eval(frame_shard: str = "mecat_eval", repo: str = "mispeech/MEC
     return result
 
 
-@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=6 * 3600,
-              memory=32768, cpu=4.0, env=HF_ENV)
+@app.function(gpu="L4", image=alt_tower_image, volumes={VOL: volume}, secrets=[hf_secret],
+              timeout=6 * 3600, memory=32768, cpu=4.0, env=HF_ENV)
 def ingest_audiocaps_eval(frame_shard: str = "audiocaps_test816", repo: str = "OpenSound/AudioCaps",
                           split: str = "test", group_key: str = "youtube_id",
                           caption_col: str = "caption", audio_feature_layer: str = "post_proj",
-                          shard_size: int = 512, limit: int = 0) -> dict:
+                          shard_size: int = 512, limit: int = 0,
+                          tower: str = "qwen", max_seconds: int = 30) -> dict:
     """Ingest a MULTI-CAPTION eval set (AudioCaps/Clotho test: ~5 captions/clip) as sharded frames.
 
     Groups rows by clip id → one audio + its list of reference captions. Writes frames (one per clip)
@@ -1035,10 +1050,15 @@ def ingest_audiocaps_eval(frame_shard: str = "audiocaps_test816", repo: str = "O
 
     dev = "cuda"
     token = os.environ.get("HF_TOKEN") or None
-    fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True, token=token)
-    sr = fe.sampling_rate
-    enc, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16,
-                                         audio_feature_layer=audio_feature_layer)
+    if tower == "qwen":
+        fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True, token=token)
+        sr = fe.sampling_rate
+        enc, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16,
+                                             audio_feature_layer=audio_feature_layer)
+        alt_embed = None
+    else:
+        alt_embed, d_audio, sr = _load_alt_audio_tower(tower, dev)
+        print(f"ALT TOWER {tower}: d_audio={d_audio} sr={sr}")
 
     ds = load_dataset(repo, split=split, streaming=True, token=token).cast_column("audio", Audio(decode=False))
     if limit:
@@ -1092,16 +1112,20 @@ def ingest_audiocaps_eval(frame_shard: str = "audiocaps_test816", repo: str = "O
         except Exception:                                        # noqa: BLE001
             n_bad += 1
             continue
-        feats = fe(wav, sampling_rate=sr, return_tensors="pt", return_attention_mask=True,
-                   padding="max_length", truncation=True)
-        mel = feats["input_features"][0]
-        am = feats.get("attention_mask")
-        if am is not None:
-            mel = mel[:, : int(am[0].sum().item())]
-        with torch.no_grad():
-            frames, fmask = enc(mel.unsqueeze(0).to(dev), torch.ones(1, mel.shape[1], dtype=torch.bool, device=dev))
-        t = int(fmask[0].sum().item())
-        shard_recs.append({"frames": frames[0, :t].cpu().contiguous(), "text": caps[0], "task": "sound"})
+        if alt_embed is not None:
+            fr = alt_embed(wav[: max_seconds * sr])
+            shard_recs.append({"frames": fr.contiguous(), "text": caps[0], "task": "sound"})
+        else:
+            feats = fe(wav, sampling_rate=sr, return_tensors="pt", return_attention_mask=True,
+                       padding="max_length", truncation=True)
+            mel = feats["input_features"][0]
+            am = feats.get("attention_mask")
+            if am is not None:
+                mel = mel[:, : int(am[0].sum().item())]
+            with torch.no_grad():
+                frames, fmask = enc(mel.unsqueeze(0).to(dev), torch.ones(1, mel.shape[1], dtype=torch.bool, device=dev))
+            t = int(fmask[0].sum().item())
+            shard_recs.append({"frames": frames[0, :t].cpu().contiguous(), "text": caps[0], "task": "sound"})
         captions_multi.append(caps); clip_ids.append(gid); n += 1     # gid = "<group_key>|<start_time>"
         if len(shard_recs) >= shard_size:
             _write()
@@ -1112,7 +1136,7 @@ def ingest_audiocaps_eval(frame_shard: str = "audiocaps_test816", repo: str = "O
     with open(str(out_dir / "index.json"), "w") as fh:
         json.dump({"d_audio": d_audio, "shard_size": shard_size, "n_total": n,
                    "shards": shard_files, "captions_multi": captions_multi, "clip_ids": clip_ids,
-                   "source_repo": repo, "group_key": group_key,
+                   "source_repo": repo, "group_key": group_key, "tower": tower,
                    "captions": [c[0] for c in captions_multi]}, fh)   # `captions`=first ref (train-format compat)
     volume.commit()
     result = {"frame_shard": frame_shard, "clips": n, "decode_fail": n_bad,
@@ -1131,8 +1155,67 @@ def _wavcaps_excluded(iid: str, excl: set) -> bool:
     return bool(cands & excl)
 
 
-@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=24 * 3600,
-              memory=32768, cpu=4.0, env=HF_ENV,
+@app.function(gpu="L4", image=fe2_smoke_image, volumes={VOL: volume}, secrets=[hf_secret],
+              timeout=3600, memory=32768, env=HF_ENV)
+def fe2_hub_smoke(repo: str = "EximiusLabs/fusion-embedding-2-2b-preview",
+                  revision: str = "") -> dict:
+    """Load the RELEASED artifact from the public HF repo through the released
+    inference.py and exercise all three modalities — the end-user path, verbatim."""
+    import sys
+
+    import numpy as np
+    import torch
+
+    sys.path.insert(0, "/root")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("fe2_inference", "/root/fe2_inference.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    fe = mod.FusionEmbedder.from_pretrained(repo, revision=revision or None, device="cuda")
+    assert fe.model.audio_adapters is not None and fe.cfg.adapter_rank == 384,         f"adapters missing: rank={fe.cfg.adapter_rank}"
+    n_ad = sum(p.numel() for p in fe.model.audio_adapters.parameters())
+
+    t1 = fe.embed_text("a dog barks in the distance")
+    t2 = fe.embed_text("rain falls on a metal roof")
+    rng = np.random.default_rng(0)
+    wav = (rng.standard_normal(16000 * 4)).astype("float32") * 0.05
+    a = fe.embed_audio(wav, sr=16000)
+    from PIL import Image
+    img = Image.fromarray((rng.random((224, 224, 3)) * 255).astype("uint8"))
+    i = fe.embed_image(img)
+
+    sims = {"t1_t1": float(t1 @ t1), "t1_t2": float(t1 @ t2),
+            "a_t1": float(a @ t1), "i_t1": float(i @ t1)}
+    out = {"repo": repo, "adapter_params": n_ad,
+           "dims": {"text": list(t1.shape), "audio": list(a.shape), "image": list(i.shape)},
+           "sims": {k: round(v, 4) for k, v in sims.items()},
+           "ok": bool(abs(sims["t1_t1"] - 1.0) < 1e-4 and sims["t1_t2"] < 0.99
+                      and t1.shape == a.shape == i.shape)}
+    print("FE2_HUB_SMOKE:", out)
+    assert out["ok"], "smoke checks failed"
+    return out
+
+
+def _load_alt_audio_tower(tower: str, device: str):
+    """Load a frozen ALTERNATE audio tower (Stage A probe). Returns (embed, d_audio, sr) where
+    ``embed(wav_f32_16k) -> FloatTensor[T, d_audio]`` (cpu). Per-clip forward (B=1) — these are
+    ~90M encoders, throughput is decode-bound anyway. ``dasheng``: masked-AE encoder from
+    GLAP's ablation winner family (~25 tok/s, d=768); weights auto-download on first use."""
+    import torch
+    if tower == "dasheng":
+        from dasheng import dasheng_base
+        model = dasheng_base().to(device).eval()
+
+        def embed(wav):
+            with torch.no_grad():
+                x = torch.from_numpy(wav).float().unsqueeze(0).to(device)
+                return model(x)[0].float().cpu()               # [T, 768]
+        return embed, 768, 16_000
+    raise ValueError(f"unknown alt tower: {tower!r} (supported: dasheng)")
+
+
+@app.function(gpu="L4", image=alt_tower_image, volumes={VOL: volume}, secrets=[hf_secret],
+              timeout=24 * 3600, memory=32768, cpu=4.0, env=HF_ENV,
               # Preemption resilience for LONG ingests (FreeSound ~13h): auto-retry + the
               # per-shard progress file below -> a crash resumes at the last completed shard.
               retries=modal.Retries(max_retries=3, initial_delay=10.0, backoff_coefficient=1.0))
@@ -1140,7 +1223,8 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
                           frame_shard: str = "wavcaps_audioset_sl", audio_feature_layer: str = "post_proj",
                           shard_size: int = 512, limit: int = 0, apply_blacklist: bool = True,
                           batch: int = 16, id_col: str = "id", caption_col: str = "caption",
-                          exclusion: str = "wavcaps", finalize: bool = True) -> dict:
+                          exclusion: str = "wavcaps", finalize: bool = True,
+                          tower: str = "qwen", max_seconds: int = 30) -> dict:
     """FUSED ingestion: stream a WavCaps mirror -> decode -> Whisper mel -> frozen audio tower ->
     SHARDED frames directly. No 108K intermediate mel files, no zip reassembly, one GPU pass.
     Applies the eval-leakage blacklist by id (AudioSet_SL heavily overlaps AudioCaps).
@@ -1165,10 +1249,15 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
 
     dev = "cuda"
     token = os.environ.get("HF_TOKEN") or None
-    fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True, token=token)
-    sr = fe.sampling_rate
-    enc, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16,
-                                         audio_feature_layer=audio_feature_layer)
+    if tower == "qwen":
+        fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True, token=token)
+        sr = fe.sampling_rate
+        enc, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16,
+                                             audio_feature_layer=audio_feature_layer)
+        alt_embed = None
+    else:
+        alt_embed, d_audio, sr = _load_alt_audio_tower(tower, dev)
+        print(f"ALT TOWER {tower}: d_audio={d_audio} sr={sr}")
 
     excl: set = set()
     if apply_blacklist and exclusion == "wavcaps":
@@ -1241,6 +1330,11 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
     def _run_tower():                                            # mel batch -> frames -> shard buffer
         if not mel_buf:
             return
+        if alt_embed is not None:                                # alt tower: raw wav, per-clip forward
+            for wav, cap in zip(mel_buf, cap_buf):
+                shard_recs.append({"frames": alt_embed(wav).contiguous(), "text": cap, "task": "sound"})
+            mel_buf.clear(); cap_buf.clear()
+            return
         n_mels = mel_buf[0].shape[0]; Fmax = max(m.shape[1] for m in mel_buf)
         mb = torch.zeros(len(mel_buf), n_mels, Fmax, device=dev)
         mm = torch.zeros(len(mel_buf), Fmax, dtype=torch.bool, device=dev)
@@ -1284,13 +1378,17 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
         except Exception:                                        # noqa: BLE001
             prog["n_bad"] += 1
             continue
-        feats = fe(wav, sampling_rate=sr, return_tensors="pt", return_attention_mask=True,
-                   padding="max_length", truncation=True)
-        mel = feats["input_features"][0]
-        am = feats.get("attention_mask")
-        if am is not None:
-            mel = mel[:, : int(am[0].sum().item())]
-        mel_buf.append(mel); cap_buf.append(cap)
+        if alt_embed is not None:
+            mel_buf.append(wav[: max_seconds * sr])              # raw wav; tower has its own frontend
+        else:
+            feats = fe(wav, sampling_rate=sr, return_tensors="pt", return_attention_mask=True,
+                       padding="max_length", truncation=True)
+            mel = feats["input_features"][0]
+            am = feats.get("attention_mask")
+            if am is not None:
+                mel = mel[:, : int(am[0].sum().item())]
+            mel_buf.append(mel)
+        cap_buf.append(cap)
         if len(mel_buf) >= batch:
             _run_tower()
         if len(shard_recs) >= shard_size:
@@ -1304,7 +1402,7 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
         with open(str(out_dir / "index.json"), "w") as fh:
             json.dump({"d_audio": d_audio, "shard_size": shard_size, "n_total": prog["n_kept"],
                        "captions": prog["captions"], "tasks": prog["tasks"],
-                       "shards": prog["shards"]}, fh)
+                       "shards": prog["shards"], "tower": tower}, fh)
         if os.path.exists(str(progress_path)):
             os.remove(str(progress_path))                        # clean finish -> no stale resume state
         volume.commit()
@@ -1313,6 +1411,23 @@ def ingest_wavcaps_frames(repo: str = "TwinkStart/wavcaps-audioset", split: str 
               "shards": len(prog["shards"]), "d_audio": d_audio, "finalized": finalize}
     print(f"INGEST_WAVCAPS_FRAMES: {result}")
     return result
+
+
+
+def _load_eval_adapters(model, ckpt, dev):
+    """Load audio adapters into an eval-time model rebuilt from a ckpt, or hard-fail.
+
+    Every eval fn that manually restores ``ckpt["resampler"]`` MUST call this: the model
+    is rebuilt from ``ckpt["config"]`` (which carries ``adapter_rank``), so an adapter
+    ckpt without this call would run zero-init (identity) adapters and SILENTLY score
+    the unadapted model."""
+    if ("adapters" in ckpt) != (model.audio_adapters is not None):
+        raise RuntimeError(f"adapter presence mismatch: ckpt has_adapters={'adapters' in ckpt} "
+                           f"but model adapter_rank={model.cfg.adapter_rank}")
+    if model.audio_adapters is not None:
+        model.audio_adapters.to(dev).float()
+        model.audio_adapters.load_state_dict(ckpt["adapters"])
+        print(f"audio adapters loaded (rank={model.cfg.adapter_rank})")
 
 
 @app.function(volumes={VOL: volume}, cpu=4.0, memory=32768, timeout=1800, env=HF_ENV)
@@ -1333,17 +1448,29 @@ def verify_shard_alignment(frame_shard: str = "laion_freesound_full", n_check: i
         ix = json.load(fh)
     caps = ix["captions"]
     bad = []
-    start = 0                                                    # cumulative — shard sizes VARY
-    for p in range(min(n_check, len(ix["shards"]))):
+    lens = ix.get("shard_lens")
+    if lens:
+        # Sampled probe across the WHOLE range (drift compounds late): starts from the
+        # persisted actual lengths, so any shard can be checked without reading its priors.
+        from fusion_embedding.data import cumulative_starts
+        starts = cumulative_starts(lens)
+        n = len(ix["shards"])
+        picks = sorted({min(int(round(f * (n - 1))), n - 1)
+                        for f in [i / max(n_check - 1, 1) for i in range(min(n_check, n))]})
+    else:
+        starts, picks = None, list(range(min(n_check, len(ix["shards"]))))
+    running = 0
+    for p in picks:
         sh = torch.load(str(d / ix["shards"][p]), map_location="cpu", weights_only=False)
+        start = starts[p] if starts is not None else running
         want = caps[start: start + len(sh["text"])]
         mism = [i for i, (a, b) in enumerate(zip(sh["text"], want)) if a != b]
         print(f"shard {p:04d}: {len(sh['text'])} recs @ start {start} | {len(mism)} caption "
-              f"mismatches" + (f" (first at {mism[0]})" if mism else ""))
+              f"mismatches" + (f" (first at {mism[0]})" if mism else ""), flush=True)
         if mism:
             bad.append({"shard": p, "n_records": len(sh["text"]), "n_mismatch": len(mism)})
-        start += len(sh["text"])
-    out = {"frame_shard": frame_shard, "checked": min(n_check, len(ix["shards"])),
+        running += len(sh["text"])
+    out = {"frame_shard": frame_shard, "checked": len(picks), "spread": bool(lens),
            "verdict": "ALIGNED" if not bad else "CORRUPTED", "bad": bad}
     print("VERIFY_SHARD_ALIGNMENT:", out)
     return out
@@ -2456,13 +2583,16 @@ def train_frames(frame_shard: str = "audiocaps4k_post_proj", steps: int = 2000,
                  d_resampler: int = 256, n_query: int = 64,
                  fn_mask_threshold: float = 0.0, soft_label_beta: float = 0.0,
                  text_cache_tag: str = "", num_workers: int = 4,
-                 train_max_frames: int = 250, init_from_ckpt: str = "") -> dict:
+                 train_max_frames: int = 250, init_from_ckpt: str = "",
+                 recaption: bool = False, adapter_rank: int = 0,
+                 skip_only: bool = False) -> dict:
     """L4 wrapper — see _train_frames_impl."""
     return _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                               load_in_4bit, gpu_note, whiten_text, run_tag, eval_816_shard,
                               use_text_cache, accum_steps, bank_negatives, peak_lr,
                               d_resampler, n_query, fn_mask_threshold, soft_label_beta,
-                              text_cache_tag, num_workers, train_max_frames, init_from_ckpt)
+                              text_cache_tag, num_workers, train_max_frames, init_from_ckpt,
+                              recaption, adapter_rank, skip_only)
 
 
 @app.function(gpu="H100", volumes={VOL: volume}, secrets=[hf_secret], timeout=16 * 3600,
@@ -2480,13 +2610,16 @@ def train_frames_a100(frame_shard: str = "audiocaps4k_post_proj", steps: int = 4
                       d_resampler: int = 256, n_query: int = 64,
                       fn_mask_threshold: float = 0.0, soft_label_beta: float = 0.0,
                       text_cache_tag: str = "", num_workers: int = 4,
-                      train_max_frames: int = 250, init_from_ckpt: str = "") -> dict:
+                      train_max_frames: int = 250, init_from_ckpt: str = "",
+                      recaption: bool = False, adapter_rank: int = 0,
+                      skip_only: bool = False) -> dict:
     """A100-80GB wrapper — bigger batch (more negatives) + more RAM for larger frame sets."""
     return _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                               load_in_4bit, gpu_note, whiten_text, run_tag, eval_816_shard,
                               use_text_cache, accum_steps, bank_negatives, peak_lr,
                               d_resampler, n_query, fn_mask_threshold, soft_label_beta,
-                              text_cache_tag, num_workers, train_max_frames, init_from_ckpt)
+                              text_cache_tag, num_workers, train_max_frames, init_from_ckpt,
+                              recaption, adapter_rank, skip_only)
 
 
 # --------------------------------------------------------------------------- #
@@ -2654,7 +2787,7 @@ def rescore_frames(frame_shard: str = "audiocaps10k_post_proj", steps: int = 400
 
     ckpt_path = str(checkpoints_dir() / f"p1frames_{frame_shard}_step{steps}{run_tag}.pt")
     ckpt = torch.load(ckpt_path, map_location=dev)
-    model.resampler.load_state_dict(ckpt["resampler"])
+    model.resampler.load_state_dict(ckpt["resampler"]); _load_eval_adapters(model, ckpt, dev)
     if isinstance(model.logit_scale, torch.nn.Parameter):
         model.logit_scale.data = ckpt["logit_scale"].to(dev)
     if "text_whitening" in ckpt:            # reproduce the whitened text geometry at eval
@@ -2844,7 +2977,7 @@ def uiq_eval(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocaps_trai
         cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit, d_audio=d_audio)
     model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder=None)
     model.resampler.to(dev).float()
-    model.resampler.load_state_dict(ckpt["resampler"])
+    model.resampler.load_state_dict(ckpt["resampler"]); _load_eval_adapters(model, ckpt, dev)
     if isinstance(model.logit_scale, torch.nn.Parameter):
         model.logit_scale.data = ckpt["logit_scale"].to(dev)
     if "text_whitening" in ckpt:
@@ -3037,7 +3170,7 @@ def rescore_qbnorm(eval_shard: str = "clotho_eval5", ckpt_shard: str = "audiocap
         cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit, d_audio=d_audio)
     model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder=None)
     model.resampler.to(dev).float()
-    model.resampler.load_state_dict(ckpt["resampler"])
+    model.resampler.load_state_dict(ckpt["resampler"]); _load_eval_adapters(model, ckpt, dev)
     if isinstance(model.logit_scale, torch.nn.Parameter):
         model.logit_scale.data = ckpt["logit_scale"].to(dev)
     if "text_whitening" in ckpt:
@@ -3168,7 +3301,7 @@ def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audioc
         cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit, d_audio=d_audio)
     model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder=None)
     model.resampler.to(dev).float()
-    model.resampler.load_state_dict(ckpt["resampler"])
+    model.resampler.load_state_dict(ckpt["resampler"]); _load_eval_adapters(model, ckpt, dev)
     if isinstance(model.logit_scale, torch.nn.Parameter):
         model.logit_scale.data = ckpt["logit_scale"].to(dev)
     if "text_whitening" in ckpt:
@@ -3194,13 +3327,27 @@ def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audioc
               memory=32768, env=HF_ENV)
 def precompute_text_cache(frame_shard: str = "audiocaps10k_sharded", batch: int = 64,
                           load_in_4bit: bool = True, native_template: bool = False,
-                          cache_tag: str = "") -> dict:
+                          cache_tag: str = "", recaption: bool = False,
+                          copy_from_tag: str = "_native", overwrite: bool = False) -> dict:
     """STEP 2: cache the frozen-base RAW pooled text embedding for every clip, beside its frame shard.
 
     Because the base + captions are frozen, text embeddings are deterministic — precompute them ONCE so
     training skips the text-side base forward each step (~2× fewer base forwards) and can later hold a
     large text-negative bank. Writes ``shard-NNNN.txtemb.pt`` (fp16 ``[n_clips, d_llm]``, RAW/pre-
     whitening) next to each frame shard and sets ``text_cache=True`` in the index. Comma-sep = multi-src.
+
+    ``recaption=True`` (Leg B): embed the Gemini rewrites from ``recaption/<source>.json`` instead of
+    the shard's stored text — pass a DISTINCT ``cache_tag`` (e.g. ``_native_recap``) so the original
+    cache survives. SKIP rows embed the original caption (they're excluded at train time; the row must
+    exist positionally). Sources WITHOUT a recaption file get their existing ``copy_from_tag`` cache
+    files copied to the new tag (no GPU) so one tag covers the whole mixed corpus.
+
+    Alignment: recaption indices are positions in ``index.json["captions"]``, which follows ACTUAL
+    cumulative shard order. Webdataset-ingested shards VARY in size (515–527, one per source tar), so
+    this reads each shard's true length from its ``copy_from_tag`` cache tensor (fallback: the shard
+    itself), maps via ``cumulative_starts``, and persists ``shard_lens`` into index.json for the
+    trainer. NEVER assume ``p * shard_size``. ``overwrite=True`` recomputes existing cache files
+    (used once to repair the 2026-07-10 uniform-offset miswrite).
     """
     import json
 
@@ -3227,19 +3374,72 @@ def precompute_text_cache(frame_shard: str = "audiocaps10k_sharded", batch: int 
     collator = FrameCollator(cfg, _HFTok(tokenizer, cfg))
     print(f"d_llm={cfg.d_llm} | caching text for {len(shard_names)} source(s)")
 
+    if recaption:
+        assert cache_tag, "recaption=True needs a distinct cache_tag (e.g. _native_recap)"
+
     total = 0
     for nm in shard_names:
         fd = frames_dir(nm)
         with open(str(fd / "index.json")) as fh:
             idx = json.load(fh)
-        for sname in idx["shards"]:
+        recap_ov = None
+        if recaption:
+            from fusion_embedding.paths import data_root
+            rp = data_root() / "recaption" / f"{nm}.json"
+            if rp.exists():
+                from fusion_embedding.data import load_recaption
+                recap_ov, recap_sk = load_recaption(rp, 0)      # local (per-source) indices
+                print(f"  {nm}: recaption file — {len(recap_ov)} rewritten, {len(recap_sk)} SKIP "
+                      f"(SKIP rows embed original text; excluded at train time)")
+            else:
+                print(f"  {nm}: no recaption file — copying {copy_from_tag} cache to {cache_tag}")
+
+        # ACTUAL per-shard lengths (shards vary 515–527 on webdataset sources — p*shard_size
+        # misaligns). Read from the existing cache tensor (2MB) instead of the frame shard (~2GB);
+        # persist for the trainer, which needs the same starts for captions_override/exclude.
+        import os as _os
+        import shutil as _sh
+        shard_lens = idx.get("shard_lens")
+        if not shard_lens:
+            shard_lens = []
+            for sname in idx["shards"]:
+                lp = text_emb_shard_path(fd / sname, copy_from_tag)
+                if _os.path.exists(lp):
+                    shard_lens.append(int(torch.load(lp, map_location="cpu",
+                                                     weights_only=False)["text_emb"].shape[0]))
+                else:
+                    shard_lens.append(len(torch.load(str(fd / sname), map_location="cpu",
+                                                     weights_only=False)["text"]))
+            idx["shard_lens"] = shard_lens
+            with open(str(fd / "index.json"), "w") as fh:
+                json.dump(idx, fh)
+            volume.commit()
+        assert sum(shard_lens) == len(idx["captions"]), \
+            f"{nm}: shard_lens sum {sum(shard_lens)} != captions {len(idx['captions'])}"
+        from fusion_embedding.data import cumulative_starts
+        starts = cumulative_starts(shard_lens)
+        print(f"  {nm}: {len(shard_lens)} shards, sizes {min(shard_lens)}-{max(shard_lens)}, "
+              f"n={sum(shard_lens)}")
+
+        for p_shard, sname in enumerate(idx["shards"]):
             sp = fd / sname
-            import os as _os
-            if _os.path.exists(text_emb_shard_path(sp, cache_tag)):   # resume: shard already cached
+            if not overwrite and _os.path.exists(text_emb_shard_path(sp, cache_tag)):
                 print(f"  {nm}/{sname}: cache exists, skipping", flush=True)
                 continue
+            if recaption and recap_ov is None:
+                src_cache = text_emb_shard_path(sp, copy_from_tag)
+                if _os.path.exists(src_cache):                 # unchanged source: reuse, no GPU
+                    _sh.copyfile(src_cache, text_emb_shard_path(sp, cache_tag))
+                    volume.commit()
+                    continue
+                # fall through: no existing cache to copy — compute from shard text
             shard = torch.load(str(sp), map_location="cpu", weights_only=False)
             texts, tasks = shard["text"], shard["task"]
+            assert len(texts) == shard_lens[p_shard], \
+                f"{nm}/{sname}: len {len(texts)} != shard_lens {shard_lens[p_shard]}"
+            if recap_ov is not None:
+                g0 = starts[p_shard]                           # TRUE start (variable shard sizes)
+                texts = [recap_ov.get(g0 + j, tx) for j, tx in enumerate(texts)]
             embs = []
             for i in range(0, len(texts), batch):
                 if native_template:
@@ -3354,7 +3554,7 @@ def phase0_crossmodal(ckpt_shard: str = "audiocaps10k_sharded,fsd50k_train,wavca
     model = FusionEmbeddingModel(cfg, full.get_input_embeddings(),
                                  BaseLMAdapter(full.language_model), audio_encoder=tower)
     model.resampler.to(dev).float()
-    model.resampler.load_state_dict(ckpt["resampler"])
+    model.resampler.load_state_dict(ckpt["resampler"]); _load_eval_adapters(model, ckpt, dev)
     model.text_whitening.load_state_dict(ckpt["text_whitening"])
     model.eval()
     whiten = model.text_whitening
@@ -3483,6 +3683,12 @@ def phase0_crossmodal(ckpt_shard: str = "audiocaps10k_sharded,fsd50k_train,wavca
         "text_vs_image_WHITENED": _score(t, im_wh),
         "text_vs_image_CENTERED": _score(t_c, im_c),
         "audio_vs_text_sanity": _score(a, t),                      # what we actually trained
+        # Centered a<->t: per-modality mean removal for the trained pair too. Added
+        # 2026-07-12 for the v0.5b adapter hub diagnosis — the adapter models' raw t2a
+        # collapses via an audio hub while their CENTERED a<->i stays healthy; this
+        # variant tests whether centering likewise rescues the trained direction.
+        # NOTE t is whitened here (as trained), so center the whitened text.
+        "audio_vs_text_CENTERED": _score(a - a.mean(0), t - t.mean(0)),
     }
     out = {"dataset": dataset, "n_pairs": n, "decode_failed": n_bad, "ckpt": run_tag,
            "caption_field": caption_field,
@@ -3553,7 +3759,7 @@ def phase0_gallery(ckpt_shard: str = "audiocaps10k_sharded,fsd50k_train,wavcaps_
     model = FusionEmbeddingModel(cfg, full.get_input_embeddings(),
                                  BaseLMAdapter(full.language_model), audio_encoder=tower)
     model.resampler.to(dev).float()
-    model.resampler.load_state_dict(ckpt["resampler"])
+    model.resampler.load_state_dict(ckpt["resampler"]); _load_eval_adapters(model, ckpt, dev)
     model.text_whitening.load_state_dict(ckpt["text_whitening"])
     model.eval()
     whiten = model.text_whitening
@@ -4275,6 +4481,138 @@ def gemini_vggsound(dataset: str = "mteb/VGGSound_AV_RETRIEVAL", limit: int = 0,
     return out
 
 
+RECAPTION_PROMPT = """You rewrite audio file metadata into clean audio captions.
+
+An audio caption describes ONLY what a listener hears in the recording: sound events, \
+their sources, and how they unfold. Style rules:
+- One sentence, present tense, 8-20 words.
+- No proper nouns, brand names, place names, dates, usernames, or attributions.
+- No recording-gear or file talk (microphones, sample rates, "recorded with", "loop", "sample pack").
+- No quality/rating/licensing notes.
+- Neutral, concrete, specific about the sound itself. Prefer "a", "an", "some" over "the".
+
+Examples of the target style (unrelated to the inputs below):
+- "A man speaks while a car engine idles nearby."
+- "Rain falls steadily onto a metal roof with occasional distant thunder."
+- "A dog barks repeatedly as birds chirp in the background."
+
+The metadata may be noisy: titles, tags, gear descriptions, personal notes. Infer what \
+the audio most plausibly contains and caption THAT. Do not invent specific details the \
+metadata does not support — if the metadata only says a drum was sampled, the caption is \
+about a drum hit, not a full performance. If the metadata truly says nothing about the \
+sound content, output the single word SKIP for that item.
+
+Rewrite each numbered item below. Return a JSON array of strings, one caption per item, \
+same order, no other text.
+
+{items}"""
+
+
+@app.function(image=gemini_embed_image, secrets=[modal.Secret.from_name("gemini-api-key")],
+              volumes={VOL: volume}, cpu=8.0, memory=8192, timeout=8 * 3600, env=HF_ENV)
+def recaption_source(source: str, limit: int = 0, batch: int = 20, workers: int = 16,
+                     model_id: str = "gemini-2.5-flash", commit_every: int = 100) -> dict:
+    """Rewrite a frame source's metadata captions into audio-caption style via Gemini (the
+    v0.4 Leg B corpus lever; prompt validated on a 200-item prototype, 2026-07-09).
+
+    Reads frames/<source>/index.json, writes recaption/<source>.json as {idx_str: caption}
+    where caption may be the literal "SKIP" (metadata carries no sound content — such clips
+    are DROPPED at corpus assembly, per the adopted skip policy). Resumable: already-done
+    idxs are skipped on restart, so a rerun retries only failures. Self-paced (~16 workers,
+    well under flash tier RPM); thinking disabled (rewrite task, keeps output tokens cheap).
+    The API key comes from the Modal secret `gemini-api-key` and is never logged."""
+    import json
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from google import genai
+    from google.genai import types as gtypes
+
+    from fusion_embedding.paths import data_root, frames_dir
+
+    client = genai.Client()
+    gen_cfg = gtypes.GenerateContentConfig(
+        temperature=0.4, response_mime_type="application/json", max_output_tokens=8192,
+        thinking_config=gtypes.ThinkingConfig(thinking_budget=0))
+
+    index = json.loads((frames_dir(source) / "index.json").read_text(encoding="utf-8"))
+    captions = index["captions"][: limit or None]
+    out_dir = data_root() / "recaption"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{source}.json"
+    done: dict = json.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
+    todo = [i for i in range(len(captions)) if str(i) not in done]
+    print(f"{source}: {len(captions)} captions, {len(done)} already done, {len(todo)} to go")
+
+    chunks = [todo[b:b + batch] for b in range(0, len(todo), batch)]
+    lock = threading.Lock()
+    n_completed_batches, failed_idxs = 0, []
+
+    err_log_budget = [40]                                     # sample of failures, key-free
+
+    def run_chunk(idxs: list) -> tuple:
+        items = "\n".join(f"{j + 1}. {captions[i][:600]}" for j, i in enumerate(idxs))
+        prompt = RECAPTION_PROMPT.format(items=items)
+        last_err = ""
+        for attempt in range(5):
+            try:
+                resp = client.models.generate_content(model=model_id, contents=prompt,
+                                                      config=gen_cfg)
+                if resp.text is None:                        # blocked/empty candidate
+                    fr = resp.candidates[0].finish_reason if resp.candidates else "no candidates"
+                    raise ValueError(f"empty response, finish_reason={fr}")
+                caps_out = json.loads(resp.text)
+                if not (isinstance(caps_out, list) and len(caps_out) == len(idxs)
+                        and all(isinstance(c, str) for c in caps_out)):
+                    raise ValueError(f"bad shape: {type(caps_out)} len "
+                                     f"{len(caps_out) if isinstance(caps_out, list) else '-'}"
+                                     f" want {len(idxs)}")
+                return idxs, caps_out
+            except Exception as e:  # noqa: BLE001 — 429/5xx/parse all take the same backoff
+                last_err = f"{type(e).__name__}: {str(e)[:200]}"
+                if attempt == 4:
+                    with lock:
+                        if err_log_budget[0] > 0:
+                            err_log_budget[0] -= 1
+                            print(f"batch@{idxs[0]} FAILED after retries: {last_err}", flush=True)
+                    return idxs, None
+                time.sleep(5 * 2 ** attempt)
+
+    def flush():
+        tmp = out_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(done), encoding="utf-8")
+        tmp.replace(out_path)
+        volume.commit()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(run_chunk, c) for c in chunks]
+        for fut in as_completed(futures):
+            idxs, caps_out = fut.result()
+            with lock:
+                if caps_out is None:
+                    failed_idxs.extend(idxs)
+                else:
+                    for i, c in zip(idxs, caps_out):
+                        done[str(i)] = c
+                n_completed_batches += 1
+                if n_completed_batches % commit_every == 0:
+                    flush()
+                    print(f"progress: {n_completed_batches}/{len(chunks)} batches, "
+                          f"{len(done)} done, {len(failed_idxs)} failed idxs", flush=True)
+
+    flush()
+    n_skip = sum(1 for c in done.values() if c.strip().upper() == "SKIP")
+    if failed_idxs:
+        (out_dir / f"{source}_failures.json").write_text(json.dumps(sorted(failed_idxs)))
+        volume.commit()
+    report = {"source": source, "n_captions": len(captions), "n_done": len(done),
+              "n_skip": n_skip, "n_failed": len(failed_idxs), "model": model_id,
+              "out": str(out_path)}
+    print("RECAPTION:", json.dumps(report, indent=2))
+    return report
+
+
 # Separate image for the LAION-CLAP protocol-validation baseline (MECAT): laion_clap pins
 # an old numpy and drags webdataset/torchlibrosa — keep it out of the training image.
 laion_clap_image = (
@@ -4462,7 +4800,8 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                        accum_steps=1, bank_negatives=False, peak_lr=0.0,
                        d_resampler=256, n_query=64, fn_mask_threshold=0.0,
                        soft_label_beta=0.0, text_cache_tag="", num_workers=4,
-                       train_max_frames=250, init_from_ckpt="") -> dict:
+                       train_max_frames=250, init_from_ckpt="", recaption=False,
+                       adapter_rank=0, skip_only=False) -> dict:
     import glob
     import itertools
     import json
@@ -4526,10 +4865,15 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
     # (measured 2026-07-01: eff-1024 at lr 1e-4 with 4× fewer opt steps was LR-starved).
     lr_kw = {"lr": float(peak_lr)} if peak_lr else {}
     # d_resampler/n_query are the HLD §4.2 capacity dials — parameterized for the capacity A/B.
+    if adapter_rank and not use_text_cache:
+        # A live text forward inside the trainer's adapter scope would ADAPT the frozen
+        # text targets (encode_text hard-fails on it) — adapters require the text cache.
+        raise ValueError("adapter_rank > 0 requires use_text_cache=True")
     cfg0 = FusionConfig(n_query=int(n_query), d_resampler=int(d_resampler),
                         fn_mask_threshold=float(fn_mask_threshold),
                         soft_label_beta=float(soft_label_beta),
                         lambda_coral=lambda_coral, max_steps=steps,
+                        adapter_rank=int(adapter_rank),
                         **lr_kw)
     cfg, embed_tokens, base_lm, tokenizer = load_base(
         cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit,
@@ -4539,6 +4883,10 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
 
     model = FusionEmbeddingModel(cfg, embed_tokens, base_lm, audio_encoder=None)  # no tower at train time
     model.resampler.to(dev).float()
+    if model.audio_adapters is not None:
+        model.audio_adapters.to(dev).float()
+        print(f"audio adapters: rank={cfg.adapter_rank} x {len(model.audio_adapters)} layers = "
+              f"{sum(p.numel() for p in model.audio_adapters.parameters())/1e6:.1f}M params")
     if isinstance(model.logit_scale, torch.nn.Parameter):
         model.logit_scale.data = model.logit_scale.data.to(dev)
     collator = FrameCollator(cfg, _HFTok(tokenizer, cfg))
@@ -4547,39 +4895,78 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
         # Streaming: one big sequential read per shard, no full-RAM preload. Concatenate sources with
         # a running global offset (partial last shards handled by explicit shard_starts). Eval = first
         # N unique captions (by global index), materialised into RAM; everything else streams.
-        from fusion_embedding.data import ShardedFrameDataset, load_frame_clips
+        from fusion_embedding.data import ShardedFrameDataset, load_frame_clips, load_recaption
+        from fusion_embedding.paths import data_root
         shard_paths, captions, shard_starts, running = [], [], [], 0
+        recap_override, recap_skip = {}, set()
         for nm, fd, idx in loaded:
+            src_base = running
             ssz = int(idx["shard_size"]); caps = idx["captions"]; shards = idx["shards"]
+            # Webdataset-ingested shards VARY in size (one per source tar, 515–527) — the uniform
+            # formula drifts global indices there. Prefer the ACTUAL lengths that
+            # precompute_text_cache persists; recaption REQUIRES them (caption↔clip pairing).
+            lens = idx.get("shard_lens")
+            if lens:
+                assert len(lens) == len(shards) and sum(lens) == len(caps), \
+                    f"{nm}: shard_lens inconsistent with index"
+            elif recaption:
+                raise ValueError(f"{nm}: recaption needs index.json['shard_lens'] — "
+                                 f"run precompute_text_cache (it persists actual shard lengths)")
             for p, s in enumerate(shards):
                 shard_paths.append(str(fd / s)); shard_starts.append(running)
-                cnt = ssz if p < len(shards) - 1 else (len(caps) - ssz * (len(shards) - 1))
+                cnt = (int(lens[p]) if lens
+                       else ssz if p < len(shards) - 1 else (len(caps) - ssz * (len(shards) - 1)))
                 running += cnt
+            if recaption or skip_only:
+                # Leg B: swap this source's captions for their Gemini rewrites; SKIP clips
+                # (metadata carried no sound content) are excluded from train AND bank below.
+                # skip_only (v0.5): keep ORIGINAL captions but still drop the SKIP clips —
+                # the one component of the recaption run that was unambiguously right.
+                # Sources without a recaption file (AudioCaps/FSD50K/ASL) keep originals.
+                rp = data_root() / "recaption" / f"{nm}.json"
+                if rp.exists():
+                    ov, sk = load_recaption(rp, src_base)
+                    recap_skip.update(sk)
+                    if recaption:
+                        caps = [ov.get(src_base + j, c) for j, c in enumerate(caps)]
+                        recap_override.update(ov)
+                    print(f"recaption {nm}: {len(ov) if recaption else 0} rewritten, "
+                          f"{len(sk)} SKIP-dropped{' (skip_only)' if not recaption else ''}")
+                else:
+                    print(f"recaption {nm}: no file at {rp} — keeping original captions")
             captions += caps
         eval_caps, eval_gidx = set(), []
         for gi, cap in enumerate(captions):
+            if gi in recap_skip:
+                continue
             if len(eval_gidx) < eval_size and cap not in eval_caps:
                 eval_gidx.append(gi); eval_caps.add(cap)
-        n_train_report = len(captions) - len(eval_gidx)
+        n_train_report = len(captions) - len(eval_gidx) - len(recap_skip)
         print(f"sharded: {len(shard_names)} source(s), {len(shard_paths)} shards, {len(captions)} clips "
-              f"| train~{n_train_report} eval={len(eval_gidx)} | text_cache={use_text_cache}")
+              f"| train~{n_train_report} eval={len(eval_gidx)} skip={len(recap_skip)} "
+              f"| text_cache={use_text_cache}")
         eval_ds = InMemoryFrameDataset(
             load_frame_clips(shard_paths, shard_starts, eval_gidx, with_text_emb=use_text_cache,
-                             text_emb_tag=text_cache_tag))
+                             text_emb_tag=text_cache_tag,
+                             captions_override=recap_override or None))
         # shuffle_buffer sized for LONG-clip corpora: FreeSound frames average ~4.5MB/clip, so
         # 4096 buffered items ~= 18GB RAM PER WORKER (2026-07-06: 6 workers x 4096 exhausted the
         # container's tensor-share space -> worker death -> silent hang). 1024 + shuffled shard
         # order keeps randomization adequate at ~4.6GB/worker.
-        train_ds = ShardedFrameDataset(shard_paths, shard_starts, exclude=set(eval_gidx),
+        train_ds = ShardedFrameDataset(shard_paths, shard_starts,
+                                       exclude=set(eval_gidx) | recap_skip,
                                        shuffle_buffer=1024, seed=0, use_text_emb=use_text_cache,
                                        text_emb_tag=text_cache_tag,
-                                       max_frames=int(train_max_frames))
+                                       max_frames=int(train_max_frames),
+                                       captions_override=recap_override or None)
         # prefetch_factor=2 + file_system sharing avoids the shm blowout (was workers4xprefetch4).
         # Workers scale with corpus: 2 sufficed at 131K; 484K/940 shards starved the H100 to
         # ~55s/step (2026-07-06) -> parameterized, default 4.
         loader = DataLoader(train_ds, batch_size=batch_size, collate_fn=collator, num_workers=int(num_workers),
                             persistent_workers=True, prefetch_factor=2, drop_last=True)
     else:
+        if recaption or skip_only:
+            raise ValueError("recaption/skip_only require sharded frame sources")
         # Legacy per-clip .pt files: preload frames into RAM once (still supported for old shards).
         _, fdir, index = loaded[0]
         eval_caps, eval_paths, train_paths = set(), [], []
@@ -4629,7 +5016,7 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
     if bank_negatives:
         from fusion_embedding.memory_bank import build_corpus_bank_from_cache
         bank = build_corpus_bank_from_cache(shard_paths, captions, model.text_whitening,
-                                            exclude=set(eval_gidx), device=dev,
+                                            exclude=set(eval_gidx) | recap_skip, device=dev,
                                             text_emb_tag=text_cache_tag)
         print(f"text-negative bank: {len(bank)} entries "
               f"({bank.n_duplicate_captions} rows in duplicate-caption groups)")
@@ -4649,7 +5036,8 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
     resume_key = (f"{frame_shard}|d{cfg.d_resampler}|N{cfg.n_query}|b{batch_size}x{accum_steps}"
                   f"|lr{peak_lr or cfg.lr}|bank{int(bank_negatives)}|4bit{int(load_in_4bit)}"
                   f"|wh{int(whiten_text)}|fn{cfg.fn_mask_threshold}|sl{cfg.soft_label_beta}"
-                  f"|tc{text_cache_tag}|init{init_from_ckpt}")
+                  f"|tc{text_cache_tag}|init{init_from_ckpt}|recap{int(recaption)}"
+                  f"|ar{int(adapter_rank)}|sk{int(skip_only)}")
     start_step = load_resume_ckpt(resume_path, model, opt, sched, total_steps=steps,
                                   config_key=resume_key)
     print(f"RESUME: continuing from step {start_step}/{steps}" if start_step > 0
@@ -4671,19 +5059,24 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
         try:
             for _micro in range(accum_steps):
                 batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in next(di).items()}
-                out = model(batch)
-                if bank is not None:
-                    loss, m = loss_fn(out["audio"], out["text"], out["logit_scale"],
-                                      bank_text=bank.embs,
-                                      bank_exclude_mask=bank.exclude_mask(batch["texts"], device=dev))
-                else:
-                    loss, m = loss_fn(out["audio"], out["text"], out["logit_scale"])
-                # Divergence guard: a non-finite loss never recovers — stop NOW instead of burning
-                # the remaining steps (and never backprop NaNs into the resampler/optimizer state).
-                if not torch.isfinite(loss):
-                    diverged_at = step
-                    break
-                (loss / accum_steps).backward()
+                # adapter_scope spans forward AND backward: gradient-checkpointed layers
+                # re-run their forward during backward(), and the recompute must see the
+                # gate open or the adapters drop out of the graph (loud CheckpointError
+                # with use_reentrant=False; still — never rely on that). No-op when off.
+                with model.adapter_scope():
+                    out = model(batch)
+                    if bank is not None:
+                        loss, m = loss_fn(out["audio"], out["text"], out["logit_scale"],
+                                          bank_text=bank.embs,
+                                          bank_exclude_mask=bank.exclude_mask(batch["texts"], device=dev))
+                    else:
+                        loss, m = loss_fn(out["audio"], out["text"], out["logit_scale"])
+                    # Divergence guard: a non-finite loss never recovers — stop NOW instead of
+                    # burning the remaining steps (and never backprop NaNs into the optimizer state).
+                    if not torch.isfinite(loss):
+                        diverged_at = step
+                        break
+                    (loss / accum_steps).backward()
         except torch.cuda.OutOfMemoryError as e:
             # OOM guard: a config that doesn't fit never will — report a RESULT instead of
             # raising, so Modal's auto-retry doesn't rerun a deterministic failure 3x (the
@@ -4756,15 +5149,24 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
 
     drift = guard.max_drift(model)
     ckpt = str(checkpoints_dir() / f"p1frames_{frame_shard}_step{steps}{run_tag}.pt")
-    torch.save({"resampler": model.resampler.state_dict(),
-                "logit_scale": model.logit_scale.detach().cpu(),
-                "text_whitening": model.text_whitening.state_dict(),
-                "base_4bit": bool(load_in_4bit),   # rescoring MUST match the training precision
-                "config": cfg.__dict__, "frame_shard": frame_shard, "steps": steps}, ckpt)
+    ckpt_state = {"resampler": model.resampler.state_dict(),
+                  "logit_scale": model.logit_scale.detach().cpu(),
+                  "text_whitening": model.text_whitening.state_dict(),
+                  "base_4bit": bool(load_in_4bit),   # rescoring MUST match the training precision
+                  "config": cfg.__dict__, "frame_shard": frame_shard, "steps": steps}
+    if model.audio_adapters is not None:
+        ckpt_state["adapters"] = model.audio_adapters.state_dict()
+    torch.save(ckpt_state, ckpt)
     result = {
         "gpu": torch.cuda.get_device_name(0), "frame_shard": frame_shard, "d_audio": d_audio,
         "sharded": sharded, "n_train": n_train_report, "n_eval": len(eval_ds),
         "whiten_text": whiten_text, "whiten_stats": wstats, "text_cache": use_text_cache,
+        "adapter_rank": int(adapter_rank),
+        "adapter_params": (sum(p.numel() for p in model.audio_adapters.parameters())
+                           if model.audio_adapters is not None else 0),
+        "recaption": recaption, "skip_only": skip_only,
+        "n_recaptioned": len(recap_override) if recaption else 0,
+        "n_recap_skipped": len(recap_skip) if (recaption or skip_only) else 0,
         "batch_size": batch_size, "accum_steps": accum_steps,
         "effective_batch": batch_size * accum_steps,
         "bank_negatives": len(bank) if bank is not None else 0,

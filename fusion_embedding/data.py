@@ -264,19 +264,60 @@ def _shard_record(shard: dict, off: int, text_embs: Optional[torch.Tensor] = Non
     return rec
 
 
+RECAPTION_SKIP = "SKIP"
+
+
+def load_recaption(path, src_base: int = 0) -> tuple:
+    """Read a recaption file (``{local_idx_str: caption}``, produced by ``recaption_source``)
+    into ``(override, skip)`` keyed by GLOBAL index (``local + src_base``).
+
+    Captions equal to the literal ``SKIP`` (metadata carried no sound content) land in
+    ``skip`` — those clips are dropped from training/bank via the ``exclude`` mechanism;
+    everything else lands in ``override`` for ``captions_override``.
+    """
+    import json
+    with open(str(path), encoding="utf-8") as fh:
+        recap = json.load(fh)
+    override, skip = {}, set()
+    for k, v in recap.items():
+        g = src_base + int(k)
+        if str(v).strip().upper() == RECAPTION_SKIP:
+            skip.add(g)
+        else:
+            override[g] = v
+    return override, skip
+
+
 def shard_starts_from(n_shards: int, shard_size: int, n_total: int) -> list[int]:
-    """Global start index of each shard for a SINGLE source (only its last shard is partial)."""
+    """Global start index of each shard for a SINGLE source (only its last shard is partial).
+
+    ONLY valid for uniformly-sized shards. Webdataset-ingested sources emit one shard per
+    source tar with VARYING sizes (515–527 observed) — for those, use ``cumulative_starts``
+    over the actual per-shard lengths (``index.json["shard_lens"]``), never this formula.
+    """
     return [min(p * shard_size, n_total) for p in range(n_shards)]
+
+
+def cumulative_starts(shard_lens: Sequence[int]) -> list[int]:
+    """Start index of each shard from ACTUAL per-shard lengths (the variable-size-safe path)."""
+    starts, running = [], 0
+    for n in shard_lens:
+        starts.append(running)
+        running += int(n)
+    return starts
 
 
 def load_frame_clips(shard_paths: Sequence, shard_starts: Sequence[int],
                      global_indices: Iterable[int], *, with_text_emb: bool = False,
-                     text_emb_tag: str = "") -> list[dict]:
+                     text_emb_tag: str = "",
+                     captions_override: Optional[dict] = None) -> list[dict]:
     """Materialise specific clips (by global index) into a list — for the small held-out eval set.
 
     ``shard_starts[p]`` is the global index of clip 0 in shard ``p`` (robust to partial shards when
     several sources are concatenated). Reads only the shards that actually hold a wanted clip.
     ``with_text_emb`` also loads the sibling text-emb cache (Step 2) and attaches ``text_emb`` per clip.
+    ``captions_override`` maps global index → replacement caption (the recaption path); overridden
+    records carry the new text, so use a text-emb cache tag built from the same captions.
     """
     import bisect
     import os
@@ -296,7 +337,12 @@ def load_frame_clips(shard_paths: Sequence, shard_starts: Sequence[int],
                 raise FileNotFoundError(f"text cache missing: {tp} — run precompute_text_cache first")
             tembs = torch.load(tp, map_location="cpu", weights_only=False)["text_emb"]
         for off in sorted(by_shard[pos]):
-            out.append(_shard_record(shard, off, tembs))
+            rec = _shard_record(shard, off, tembs)
+            if captions_override is not None:
+                ov = captions_override.get(starts[pos] + off)
+                if ov is not None:
+                    rec["text"] = ov
+            out.append(rec)
     return out
 
 
@@ -307,17 +353,21 @@ class ShardedFrameDataset(IterableDataset):
     avoids both the full-RAM preload and the per-clip network latency of ``CachedFrameDataset``.
     ``shard_starts[p]`` gives the global index of shard ``p``'s first clip (so several sources'
     shards can be concatenated even with partial last shards); ``exclude`` is a set of those global
-    indices to skip (the held-out eval clips). Shards are split disjointly across DataLoader workers,
-    and re-iterating yields a fresh (reshuffled) pass. Emits ``{frames, text, task, instruction}``.
+    indices to skip (held-out eval clips, and recaption-SKIP clips). ``captions_override`` maps
+    global index → replacement caption (the recaption path; pair with a matching text-emb cache
+    tag). Shards are split disjointly across DataLoader workers, and re-iterating yields a fresh
+    (reshuffled) pass. Emits ``{frames, text, task, instruction}``.
     """
 
     def __init__(self, shard_paths: Sequence, shard_starts: Sequence[int], *,
                  exclude: Optional[set] = None, shuffle_buffer: int = 2048,
                  shuffle_shards: bool = True, seed: int = 0, use_text_emb: bool = False,
-                 text_emb_tag: str = "", max_frames: int = 0):
+                 text_emb_tag: str = "", max_frames: int = 0,
+                 captions_override: Optional[dict] = None):
         self.shard_paths = [str(p) for p in shard_paths]
         self.shard_starts = list(shard_starts)
         self.exclude = set(exclude or ())
+        self.captions_override = captions_override or None
         self.shuffle_buffer = max(1, shuffle_buffer)
         self.shuffle_shards = shuffle_shards
         self.seed = seed
@@ -354,6 +404,10 @@ class ShardedFrameDataset(IterableDataset):
                 if (start + off) in self.exclude:
                     continue
                 rec = _shard_record(shard, off, tembs)
+                if self.captions_override is not None:
+                    ov = self.captions_override.get(start + off)
+                    if ov is not None:
+                        rec["text"] = ov
                 if self.max_frames and rec["frames"].shape[0] > self.max_frames:
                     t0 = buf_rng.randrange(rec["frames"].shape[0] - self.max_frames + 1)
                     rec["frames"] = rec["frames"][t0: t0 + self.max_frames].contiguous()

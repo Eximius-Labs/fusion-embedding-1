@@ -212,6 +212,17 @@ class FusionEmbeddingModel(nn.Module):
 
         self._freeze_base()
 
+        # Modality-gated deep adapters (cfg.adapter_rank > 0): in-layer trainable capacity
+        # for AUDIO forwards only. Owned HERE (not under base_lm) so the RegressionGuard
+        # snapshot and the frozen base's state_dict stay adapter-free; hooks on the base's
+        # decoder layers are pure pass-throughs while the gate is closed.
+        self.audio_adapters: Optional[nn.ModuleList] = None
+        self._adapter_gate = None
+        if cfg.adapter_rank > 0:
+            from .adapters import attach_gated_adapters
+            self.audio_adapters, self._adapter_gate, self._adapter_handles = attach_gated_adapters(
+                self.base_lm, cfg.d_llm, cfg.adapter_rank, cfg.adapter_act)
+
     # ----------------------------- freeze logic ---------------------------- #
     def _freeze_base(self) -> None:
         """Freeze base LLM, embed_tokens, and audio encoder; only resampler + temp train."""
@@ -231,8 +242,24 @@ class FusionEmbeddingModel(nn.Module):
 
     def trainable_parameters(self) -> Iterator[nn.Parameter]:
         yield from self.resampler.parameters()
+        if self.audio_adapters is not None:
+            yield from self.audio_adapters.parameters()
         if isinstance(self.logit_scale, nn.Parameter):
             yield self.logit_scale
+
+    def adapter_scope(self):
+        """Open the audio-adapter gate for the duration of a ``with`` block.
+
+        REQUIRED around forward+backward of any audio training step when the base runs
+        with gradient checkpointing: checkpointed layers re-run their forward during
+        ``backward()``, and the recomputation must see the same gate state or the
+        adapters silently drop out of the gradient graph. No-op context when adapters
+        are disabled.
+        """
+        if self._adapter_gate is not None:
+            return self._adapter_gate
+        import contextlib
+        return contextlib.nullcontext()
 
     def frozen_modules(self):
         return (self.embed_tokens, self.base_lm, self.audio_encoder)
@@ -304,9 +331,10 @@ class FusionEmbeddingModel(nn.Module):
         attention_mask: torch.Tensor,
         audio_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Inject audio -> frozen LLM -> EOS pooling. Returns full-dim pooled [B,d_llm]."""
+        """Inject audio -> frozen LLM (audio adapters gated ON) -> EOS pooling. [B,d_llm]."""
         embeds = self.inject_audio(input_ids, attention_mask, audio_tokens)
-        hidden = self.base_lm(inputs_embeds=embeds, attention_mask=attention_mask)
+        with self.adapter_scope():
+            hidden = self.base_lm(inputs_embeds=embeds, attention_mask=attention_mask)
         return last_token_pool(hidden, attention_mask)
 
     # ------------------------------ text path ------------------------------ #
@@ -316,6 +344,13 @@ class FusionEmbeddingModel(nn.Module):
         Returns the RAW pooled vector (whitening is applied downstream in ``forward``) so that
         ``fit_text_whitening`` can estimate stats on un-whitened embeddings regardless of fit state.
         """
+        if self._adapter_gate is not None and self._adapter_gate.active:
+            # A gated text forward would adapt the FROZEN text targets — the exact
+            # invariance the adapters exist to preserve. This can only happen if a
+            # trainer holds adapter_scope() open across a live (non-cached) text
+            # forward; adapters therefore require the text-embedding cache.
+            raise RuntimeError("adapter gate is open during a text encode — "
+                               "train with use_text_cache=True when adapter_rank > 0")
         embeds = self.embed_tokens(input_ids)
         hidden = self.base_lm(inputs_embeds=embeds, attention_mask=attention_mask)
         return last_token_pool(hidden, attention_mask)

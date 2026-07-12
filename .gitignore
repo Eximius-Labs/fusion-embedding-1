@@ -21,4 +21,5 @@ results/
 # Release build artifacts + internal runbook — the shipped files live on the HF repo
 release/out/
 release/UPLOAD.md
+fe2_release/out/
 submission/

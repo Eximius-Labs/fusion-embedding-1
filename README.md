@@ -1,6 +1,6 @@
 <div align="center">
 
-![Fusion Embedding 1 — 2B Preview, by Eximius Labs](assets/banner.png)
+![Fusion Embedding, by Eximius Labs](assets/banner.png)
 
 **One model. One vector space. Text, image, video, audio — and PDF.**
 
@@ -18,9 +18,14 @@ vision-language embedding base with audio — without modifying a single base we
 
 ## What is Fusion Embedding?
 
-Fusion Embedding 1 is a family of open-weight embedding models that map **five
+Fusion Embedding is a family of open-weight embedding models that map **five
 modalities into a single shared vector space**, built for retrieval, RAG,
 clustering, and cross-modal search — and designed to be **fully self-hostable**.
+Two architecture generations are released:
+[**fusion-embedding-1**](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
+(connector-only, final at v0.3) and
+[**fusion-embedding-2**](https://huggingface.co/EximiusLabs/fusion-embedding-2-2b-preview)
+(connector + modality-gated deep adapters — the current line).
 
 Instead of training a multimodal embedder from scratch, Fusion takes
 [Qwen3-VL-Embedding](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B) — an
@@ -31,19 +36,24 @@ small trained connector (the **FusionResampler**, ~16M parameters, <1% of the
 base) that translates audio into the base's input space. Audio is aligned to
 text contrastively; because text, image, and video already share the base's
 space, **audio↔image and audio↔video alignment emerge through the text bridge**
-(the ImageBind property).
+(the ImageBind property). Generation 2 adds **modality-gated deep adapters**
+(44.2M parameters across the base's 28 layers) that give the frozen LM in-layer
+capacity to process audio — active only on audio inputs, exact pass-throughs for
+everything else (see [fusion-embedding-2](#fusion-embedding-2-modality-gated-deep-adapters)).
 
 The result: the base model's text, image, and video embeddings are **provably
-unchanged** — every training run asserts parameter-level `base_drift == 0` — so
-you inherit the base's retrieval quality exactly, and add audio on top.
+unchanged** — every training run asserts parameter-level `base_drift == 0`, and
+the adapter gate makes non-audio forwards bitwise identical to the unmodified
+base — so you inherit the base's retrieval quality exactly, and add audio on top.
 
 ## Highlights
 
 - **Five modalities, one space** — text, image, video, audio, and PDF in a
   single vector space, designed for retrieval in any direction between modalities.
-- **Frozen-base architecture** — only a ~16M-parameter connector and a temperature
-  are trained. The base is never fine-tuned; its MMEB-V2 performance is
-  inherited unchanged, by construction.
+- **Frozen-base architecture** — only audio-side components and a temperature are
+  trained (a ~16M-parameter connector in generation 1; 60.6M including gated
+  adapters in generation 2 — still ~2.3% of the stack). The base is never
+  fine-tuned; its MMEB-V2 performance is inherited unchanged, by construction.
 - **Matryoshka embeddings** — truncate to any rung of
   `{2048, 1536, 1024, 512, 256, 128, 64}` and re-normalize; embeddings stay
   consistent at every dimension (default 1024).
@@ -66,8 +76,9 @@ The connector is trained **only** on audio↔text pairs — it never sees a sing
 audio–image example. But because text, image, and video already share the frozen
 base's space, audio lands there too, and **audio→image retrieval emerges for free**.
 On VGGSound-696 (held out, in the training blacklist → zero leakage), the released
-previews retrieve the matching image from sound alone at **R@10 up to 0.418 — 29× the
-0.014 random-chance rate**. Real examples (v0.2 checkpoint):
+previews retrieve the matching image from sound alone at **R@10 up to 0.443 — 32× the
+0.014 random-chance rate** (the record is held by fusion-embedding-2's pre-fine-tune
+checkpoint; fusion-embedding-1's best is v0.2 at 0.418). Real examples (v0.2 checkpoint):
 
 **Direct hits** — the clip's own frame comes back in the top 5, surrounded by the same kind of scene:
 
@@ -110,18 +121,50 @@ the frozen text embeddings) corrects the anisotropy of decoder-LM embedding
 spaces before the contrastive loss — a refinement uniquely available to
 frozen-text architectures.
 
+## fusion-embedding-2: modality-gated deep adapters
+
+The first generation forces all audio understanding through the input-side
+connector: the frozen LM's 28 layers then process audio tokens with machinery
+built purely for text and images. Our controlled experiments located the 2B
+bottleneck exactly there — swapping the audio tower for a "better" encoder made
+retrieval *worse* (the base's ability to read the features, not the features,
+was the limit), while capacity added *inside the layers* helped immediately.
+
+**fusion-embedding-2** therefore attaches a small bottleneck adapter
+(`LayerNorm → 2048→384 → SiLU → 384→2048`, 44.2M parameters total) to every
+decoder layer, **gated to audio encoding only**: for any text, image, or video
+input the adapter hook returns the frozen layer's output untouched — the
+non-audio forward pass is *bitwise identical* to the unmodified base, so the
+frozen-space guarantee is preserved exactly, not approximately. The output
+projections are zero-initialised, making a fresh adapter stack the exact
+identity: training starts from generation-1 behaviour and can only improve.
+
+At matched training (same corpus, steps, and protocol), the adapters improved
+every retrieval direction in a controlled A/B (+3.4 AudioCaps A→T R@10 at probe
+scale, reproduced exactly at 518K-pair scale). The released
+[`fusion-embedding-2-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-2-2b-preview)
+beats fusion-embedding-1 v0.3 on the majority of release-protocol cells, with
+its largest gains in text→audio retrieval (AudioCaps T→A R@10 0.746 → 0.775;
+Clotho zero-shot T→A R@10 0.460 → 0.482) and on VGGSound audio↔text
+(0.625/0.645 → 0.665/0.681 — +4.0/+3.6), extending the lead over every unified
+embedding model we measure against.
+
 ## Model family
 
 | Model | Base | Params (trained / total) | Embedding dim | MRL ladder | Status |
 |---|---|---|---|---|---|
-| [`fusion-embedding-1-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview) | Qwen3-VL-Embedding-2B | ~16M / 2B | 2048 | 2048 → 64 | **preview released** |
-| `fusion-embedding-1-8B` | Qwen3-VL-Embedding-8B | scaled / 8B | ~4096 | ~4096 → 64 | planned |
+| [`fusion-embedding-2-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-2-2b-preview) | Qwen3-VL-Embedding-2B | 60.6M / 2B | 2048 | 2048 → 64 | **preview released (current line)** |
+| [`fusion-embedding-1-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview) | Qwen3-VL-Embedding-2B | ~16M / 2B | 2048 | 2048 → 64 | **released — final (v0.3)** |
+| `fusion-embedding-2-8b` | Qwen3-VL-Embedding-8B | scaled / 8B | ~4096 | ~4096 → 64 | planned |
 
-> **Research preview available:**
+> **Research previews available:**
+> [EximiusLabs/fusion-embedding-2-2b-preview](https://huggingface.co/EximiusLabs/fusion-embedding-2-2b-preview)
+> (current line — connector + gated adapters) and
 > [EximiusLabs/fusion-embedding-1-2b-preview](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
-> — connector weights, model card with benchmarks (AudioCaps / Clotho zero-shot /
-> VGGSound cross-modal incl. an ImageBind comparison), and a packaged inference API.
-> Training continues; updated checkpoints will be released under the same family.
+> (generation 1, final at v0.3) — trained weights, model cards with benchmarks
+> (AudioCaps / Clotho zero-shot / VGGSound cross-modal incl. an ImageBind
+> comparison), and a packaged inference API. Training continues on the
+> generation-2 line.
 
 ## Usage
 
@@ -235,28 +278,37 @@ uv run --env-file .env modal run --detach modal_app.py::train_frames_a100  # con
 
 ## Results — preview checkpoints
 
-Numbers for [`fusion-embedding-1-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
-— v0.1 (131K-pair corpus), v0.2 (484K-pair corpus incl. the full AudioCaps train split
-and a 318K LAION-FreeSound subset), and v0.3 (v0.2 + a connector-only in-domain fine-tune
-on the AudioCaps train split), same d=384 connector. Full tables and protocol details
-are on the model card.
+Numbers for the released previews:
+[`fusion-embedding-1-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
+v0.1 (131K-pair corpus), v0.2 (484K-pair corpus incl. the full AudioCaps train split
+and a 318K LAION-FreeSound subset), v0.3 (v0.2 + a connector-only in-domain fine-tune
+on the AudioCaps train split), and
+[`fusion-embedding-2-2b-preview`](https://huggingface.co/EximiusLabs/fusion-embedding-2-2b-preview)
+(gated adapters, 592K corpus with 73,716 no-sound-content clips excluded, soft-label +
+false-negative-mask contrastive flags, same in-domain fine-tune stage). Full tables and
+protocol details are on the model cards.
 
 **Audio–text retrieval** (published protocols):
 
-| Benchmark | Version | A→T R@1 | A→T R@10 | T→A R@10 |
+| Benchmark | Model | A→T R@1 | A→T R@10 | T→A R@10 |
 |---|---|---|---|---|
-| AudioCaps test (883 clips, 5-ref min-rank) | v0.1 | 0.216 | 0.626 | 0.680 |
-| AudioCaps test | v0.2 | 0.279 | 0.717 | 0.736 |
-| AudioCaps test | **v0.3** | **0.332** | **0.741** | **0.746** |
-| Clotho v2.1 eval, zero-shot (1,045 × 5 refs) | v0.1 | 0.064 | 0.252 | 0.329 |
-| Clotho v2.1 eval, zero-shot | v0.2 | **0.135** | **0.448** | 0.449 |
-| Clotho v2.1 eval, zero-shot | **v0.3** | **0.135** | 0.433 | **0.460** |
+| AudioCaps test (883 clips, 5-ref min-rank) | FE1 v0.1 | 0.216 | 0.626 | 0.680 |
+| AudioCaps test | FE1 v0.2 | 0.279 | 0.717 | 0.736 |
+| AudioCaps test | FE1 v0.3 | **0.332** | 0.741 | 0.746 |
+| AudioCaps test | **FE2** | 0.302 | **0.743** | **0.775** |
+| Clotho v2.1 eval, zero-shot (1,045 × 5 refs) | FE1 v0.1 | 0.064 | 0.252 | 0.329 |
+| Clotho v2.1 eval, zero-shot | FE1 v0.2 | **0.135** | **0.448** | 0.449 |
+| Clotho v2.1 eval, zero-shot | FE1 v0.3 | **0.135** | 0.433 | 0.460 |
+| Clotho v2.1 eval, zero-shot | **FE2** | 0.127 | 0.421 | **0.482** |
 
 CLAP-family models that fine-tune both encoders end-to-end score higher on AudioCaps
-(A→T R@10 0.906–0.928); this model keeps both towers frozen.
+(A→T R@10 0.906–0.928); the fusion-embedding models keep both towers frozen.
 
-**Cross-modal retrieval** (VGGSound-AV, 696 pairs, chance R@10 = 0.014; this model trains
-on audio–text only — its audio↔image alignment is emergent):
+**Cross-modal retrieval** (VGGSound-AV, 696 pairs, chance R@10 = 0.014; the
+fusion-embedding models train on audio–text only — their audio↔image alignment is
+emergent):
+
+![Unified-model positioning: VGGSound-696 cross-modal retrieval, R@10 averaged over both directions, versus model parameters — the fusion-embedding family leads audio↔text over LanguageBind, ImageBind, and Gemini Embedding 2, and leads the emergent audio↔image cluster (ImageBind's supervised pair annotated)](assets/fe_positioning.png)
 
 | Model | audio↔image | audio↔text | text↔image |
 |---|---|---|---|
@@ -265,21 +317,27 @@ on audio–text only — its audio↔image alignment is emergent):
 | Gemini Embedding 2 (API, 2026-07-09) | 0.312 / 0.316 | 0.379 / 0.374 | 0.273 / **0.366** |
 | fusion-embedding-1-2b-preview v0.1 | 0.368 / 0.388 | 0.555 / 0.592 | 0.331 / 0.319 |
 | fusion-embedding-1-2b-preview v0.2 | 0.418 / 0.440 | 0.588 / 0.631 | 0.331 / 0.319 |
-| **fusion-embedding-1-2b-preview v0.3** | 0.407 / 0.428 | **0.625 / 0.645** | **0.331** / 0.319 |
+| fusion-embedding-1-2b-preview v0.3 | 0.407 / 0.428 | 0.625 / 0.645 | **0.331** / 0.319 |
+| **fusion-embedding-2-2b-preview** | 0.392 / 0.430 | **0.665 / 0.681** | — / — |
 
 Each baseline wins only its supervised pair — except LanguageBind, whose supervised
-audio↔text this model also exceeds. LanguageBind's branches fine-tune diverging copies
-of the text tower (measured mean caption cosine 0.55 between branches), weakening its
-cross-branch binding — a direct illustration of why this project keeps the shared space
-frozen. Against Gemini Embedding 2 — Google's natively multimodal embedding API,
-evaluated at its documented default invocation on the date shown — this model leads
-audio↔image (both directions, ours emergent) and audio↔text (both directions), and
-splits text↔image. Full protocol notes and caveats on the model card.
+audio↔text the fusion-embedding models also exceed. LanguageBind's branches fine-tune
+diverging copies of the text tower (measured mean caption cosine 0.55 between
+branches), weakening its cross-branch binding — a direct illustration of why this
+project keeps the shared space frozen. Against Gemini Embedding 2 — Google's natively
+multimodal embedding API, evaluated at its documented default invocation on the date
+shown — the fusion-embedding models lead audio↔image (both directions, ours emergent)
+and audio↔text (both directions), and split text↔image. fusion-embedding-2's
+text↔image cells are properties of the frozen base (its text and image paths execute
+identically) and will be filled with its own readout run. Full protocol notes and
+caveats on the model cards.
 
-Best emergent audio→image is v0.2's R@10 0.418 (29× chance; v0.3: 0.407 — the in-domain
-fine-tune trades ~1 point of emergent alignment for its AudioCaps gains) — with zero
-audio–image training pairs. What that looks like (v0.2 examples; query clip's frame left;
-green = the clip's exact frame among the top 5):
+Best emergent audio→image is fusion-embedding-2's pre-fine-tune checkpoint at R@10
+0.443 (32× chance); among released fine-tuned checkpoints, FE1 v0.2 scores 0.418 and
+FE2 0.392 — the in-domain fine-tune trades ~1–2 points of emergent alignment for its
+AudioCaps gains. All with zero audio–image training pairs. What that looks like
+(v0.2 examples; query clip's frame left; green = the clip's exact frame among the
+top 5):
 
 ![Audio-to-image retrieval examples](assets/audio_to_image_gallery.png)
 
@@ -375,16 +433,19 @@ fully testable without hardware.
       (484K pairs — AudioCaps A→T R@10 0.626 → 0.717, Clotho zero-shot 0.252 → 0.448), and
       [v0.3-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.3-preview)
       (AudioCaps in-domain fine-tune stage — A→T R@1 0.279 → 0.332, R@10 0.717 → 0.741)
-- [ ] **P2 (in progress) — Corpus scaling + data quality**: corpus extended to 592K
-      (FreeSound tail + BBC Sound Effects); relevance-aware training validated in a
-      matched A/B (soft labels + false-negative masking: +2.6 A→T R@10 at equal steps);
-      in-domain fine-tune stage shipped in v0.3; connector capacity re-test at scale
-      complete (d=384 confirmed twice). Remaining: model-based recaptioning and
-      caption-quality gating, domain-weighted sampling
-- [ ] **P3 — Speech parity + grounding**: heavy multilingual speech, more query
-      tokens, direct audio↔video pairs
+- [x] **P2 — Architecture generation 2**: corpus extended to 592K (FreeSound tail +
+      BBC Sound Effects) with 73,716 no-sound-content clips excluded; relevance-aware
+      training validated in a matched A/B (soft labels + false-negative masking);
+      in-domain fine-tune stage shipped in FE1 v0.3; connector capacity re-test at
+      scale complete (d=384 confirmed twice); **modality-gated deep adapters**
+      validated in controlled A/Bs and shipped as
+      [fusion-embedding-2-2b-preview](https://huggingface.co/EximiusLabs/fusion-embedding-2-2b-preview)
+      (AudioCaps T→A R@10 0.775, VGGSound audio↔text 0.665/0.681)
+- [ ] **P3 — Speech parity + grounding**: adapter-rank scaling, AudioCaps 2.0
+      fine-tuning data, heavy multilingual speech, more query tokens, direct
+      audio↔video pairs
 - [ ] **P4 — Release**: pre-registered five-modality benchmark, model soup,
-      2B stable release; then the 8B tier
+      2B stable release; then fusion-embedding-2-8b
 - [ ] **Track C corpus**: self-generated, CLAP-gated captions on permissively
       licensed audio — the commercially clean training set
 
@@ -412,6 +473,14 @@ Matryoshka Representation Learning, and the audio-caption data ecosystem
 @software{fusion_embedding_2026,
   title  = {Fusion Embedding 1: A Unified Embedding Space for Text,
             Image, Video, and Audio},
+  author = {Tonmoy, Abdul Basit},
+  year   = {2026},
+  url    = {https://github.com/Eximius-Labs/fusion-embedding-1}
+}
+
+@software{fusion_embedding_2_2026,
+  title  = {Fusion Embedding 2: A Unified Embedding Space for Text,
+            Image, Video, and Audio with Modality-Gated Deep Adapters},
   author = {Tonmoy, Abdul Basit},
   year   = {2026},
   url    = {https://github.com/Eximius-Labs/fusion-embedding-1}

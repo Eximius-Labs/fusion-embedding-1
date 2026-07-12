@@ -70,13 +70,16 @@ def save_resume_ckpt(path: str, model: FusionEmbeddingModel, opt, sched, step: i
     run config (arch + batch + lr + data) so a resume can never silently cross A/B arms."""
     import os
     tmp = path + ".tmp"
-    torch.save({
+    state = {
         "step": int(step), "total_steps": int(total_steps), "config_key": str(config_key),
         "resampler": model.resampler.state_dict(),
         "logit_scale": model.logit_scale.detach().cpu(),
         "optimizer": opt.state_dict(),
         "scheduler": sched.state_dict(),
-    }, tmp)
+    }
+    if model.audio_adapters is not None:
+        state["adapters"] = model.audio_adapters.state_dict()
+    torch.save(state, tmp)
     os.replace(tmp, path)                                   # atomic on POSIX
 
 
@@ -98,8 +101,14 @@ def load_resume_ckpt(path: str, model: FusionEmbeddingModel, opt, sched, *, tota
         print(f"RESUME REFUSED: config_key mismatch (ckpt {ck.get('config_key', '')!r} != "
               f"run {config_key!r}) — starting fresh")
         return 0
+    if ("adapters" in ck) != (model.audio_adapters is not None):
+        print("RESUME REFUSED: adapter presence mismatch between checkpoint and model "
+              "— starting fresh")
+        return 0
     device = next(model.resampler.parameters()).device
     model.resampler.load_state_dict(ck["resampler"])
+    if model.audio_adapters is not None:
+        model.audio_adapters.load_state_dict(ck["adapters"])
     with torch.no_grad():
         model.logit_scale.copy_(ck["logit_scale"].to(model.logit_scale.device))
     opt.load_state_dict(ck["optimizer"])
@@ -155,8 +164,21 @@ def init_trainables_from_ckpt(model: FusionEmbeddingModel, ck: dict) -> dict:
         if have is not None and want is not None and int(have) != int(want):
             raise ValueError(f"init_from_ckpt architecture mismatch: ckpt {key}={have} "
                              f"but model has {key}={want}")
+    if "adapters" in ck and model.audio_adapters is None:
+        # Loading an adapter checkpoint into an adapter-less model would silently score
+        # /fine-tune the UNADAPTED model — hard-fail instead (adapter plan §4).
+        raise ValueError("checkpoint carries audio adapters but the model was built with "
+                         "adapter_rank=0 — rebuild with the checkpoint's adapter_rank")
     model.resampler.load_state_dict(ck["resampler"])
     loaded = ["resampler"]
+    if model.audio_adapters is not None:
+        if "adapters" in ck:
+            model.audio_adapters.load_state_dict(ck["adapters"])
+            loaded.append("adapters")
+        else:
+            # Warm-starting a pretrained resampler under FRESH (zero-init = identity)
+            # adapters is the intended Stage-3 arm — keep them as built.
+            loaded.append("adapters(fresh-identity)")
     if "text_whitening" in ck:
         model.text_whitening.load_state_dict(ck["text_whitening"])
         loaded.append("text_whitening")
