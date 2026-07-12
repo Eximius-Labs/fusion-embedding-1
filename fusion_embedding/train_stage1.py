@@ -26,6 +26,18 @@ from .model import FusionEmbeddingModel, mrl_truncate_normalize
 
 
 def set_seed(seed: int) -> None:
+    """Seed every RNG a training run draws from (torch init/shuffle, numpy, random).
+
+    torch.manual_seed also seeds all CUDA devices when CUDA is available."""
+    import random
+
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except ImportError:  # numpy is a torch dependency, but stay import-safe
+        pass
     torch.manual_seed(seed)
 
 

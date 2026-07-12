@@ -2601,14 +2601,14 @@ def train_frames(frame_shard: str = "audiocaps4k_post_proj", steps: int = 2000,
                  text_cache_tag: str = "", num_workers: int = 4,
                  train_max_frames: int = 250, init_from_ckpt: str = "",
                  recaption: bool = False, adapter_rank: int = 0,
-                 skip_only: bool = False) -> dict:
+                 skip_only: bool = False, seed: int = -1) -> dict:
     """L4 wrapper — see _train_frames_impl."""
     return _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                               load_in_4bit, gpu_note, whiten_text, run_tag, eval_816_shard,
                               use_text_cache, accum_steps, bank_negatives, peak_lr,
                               d_resampler, n_query, fn_mask_threshold, soft_label_beta,
                               text_cache_tag, num_workers, train_max_frames, init_from_ckpt,
-                              recaption, adapter_rank, skip_only)
+                              recaption, adapter_rank, skip_only, seed)
 
 
 @app.function(gpu="H100", volumes={VOL: volume}, secrets=[hf_secret], timeout=16 * 3600,
@@ -2628,14 +2628,14 @@ def train_frames_a100(frame_shard: str = "audiocaps4k_post_proj", steps: int = 4
                       text_cache_tag: str = "", num_workers: int = 4,
                       train_max_frames: int = 250, init_from_ckpt: str = "",
                       recaption: bool = False, adapter_rank: int = 0,
-                      skip_only: bool = False) -> dict:
+                      skip_only: bool = False, seed: int = -1) -> dict:
     """A100-80GB wrapper — bigger batch (more negatives) + more RAM for larger frame sets."""
     return _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                               load_in_4bit, gpu_note, whiten_text, run_tag, eval_816_shard,
                               use_text_cache, accum_steps, bank_negatives, peak_lr,
                               d_resampler, n_query, fn_mask_threshold, soft_label_beta,
                               text_cache_tag, num_workers, train_max_frames, init_from_ckpt,
-                              recaption, adapter_rank, skip_only)
+                              recaption, adapter_rank, skip_only, seed)
 
 
 # --------------------------------------------------------------------------- #
@@ -3336,6 +3336,137 @@ def rescore_816(eval_shard: str = "audiocaps_test816", ckpt_shard: str = "audioc
         json.dump(out, fh, indent=2)
     volume.commit()
     print("SCORE816:", json.dumps(out, indent=2))
+    return out
+
+
+def _unwrap_clap(out, proj, proj_dim):
+    """Return the projected embedding tensor from whatever a transformers CLAP
+    get_*_features call returned (tensor, *WithProjection output, or a pooling
+    output that may be pre- or post-projection)."""
+    import torch
+    for k in ("audio_embeds", "text_embeds"):
+        v = getattr(out, k, None)
+        if torch.is_tensor(v):
+            return v
+    p = out.pooler_output
+    return p if p.shape[-1] == proj_dim else proj(p)
+
+
+@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=4 * 3600,
+              memory=32768, env=HF_ENV)
+def clap_replay(eval_shard: str = "audiocaps_test816", repo: str = "OpenSound/AudioCaps",
+                split: str = "test", group_key: str = "youtube_id",
+                caption_col: str = "caption",
+                clap_repo: str = "laion/clap-htsat-fused", limit: int = 0,
+                out_name: str = "clap_replay_audiocaps883.json") -> dict:
+    """Replay a baseline CLAP model on OUR exact multi-caption min-rank protocol.
+
+    Streams the SAME HF dataset the eval shard was ingested from, grouped with the
+    SAME key as ``ingest_audiocaps_eval`` (one clip -> its reference-caption list, in
+    stream order), and ASSERTS the resulting caption groups equal the eval shard's
+    ``captions_multi`` one-for-one — the scored pool is then identical to the pool our
+    own checkpoints are scored on. Embeds audio+text with the released CLAP checkpoint
+    (transformers ClapModel, resolved revision recorded in the output) and scores with
+    the SAME helpers as ``_score_816_protocol`` (``multicaption_relevance`` +
+    ``retrieval_report``); the metric code path is shared, not reimplemented.
+    Read-only except the result JSON under checkpoints/.
+    """
+    import io
+    import itertools
+    import json
+    import os
+
+    import librosa
+    import torch
+    from datasets import Audio, load_dataset
+    from transformers import ClapModel, ClapProcessor
+
+    from fusion_embedding.paths import checkpoints_dir, frames_dir
+    from fusion_embedding.train_stage1 import (
+        flatten_caption_groups, multicaption_relevance, retrieval_report,
+    )
+
+    dev = "cuda"
+    token = os.environ.get("HF_TOKEN") or None
+
+    with open(str(frames_dir(eval_shard) / "index.json")) as fh:
+        index = json.load(fh)
+    ref_caps_multi = index["captions_multi"]
+
+    model = ClapModel.from_pretrained(clap_repo, token=token).to(dev).eval()
+    proc = ClapProcessor.from_pretrained(clap_repo, token=token)
+    clap_rev = getattr(model.config, "_commit_hash", None)
+    clap_sr = proc.feature_extractor.sampling_rate
+    print(f"CLAP {clap_repo} @ {clap_rev} | sr={clap_sr}")
+
+    ds = load_dataset(repo, split=split, streaming=True, token=token).cast_column(
+        "audio", Audio(decode=False))
+    if limit:
+        ds = itertools.islice(ds, limit * 6)  # ~5 captions/clip in stream rows
+
+    # group rows exactly like ingest_audiocaps_eval: first-seen audio + caption list
+    clips: dict = {}
+    order: list = []
+    for row in ds:
+        gid = str(row.get(group_key, "")) + "|" + str(row.get("start_time", ""))
+        cap = str(row.get(caption_col, "")).strip()
+        if gid not in clips:
+            clips[gid] = {"audio": row["audio"], "captions": []}
+            order.append(gid)
+        clips[gid]["captions"].append(cap)
+        if limit and len(order) >= limit and gid != order[-1]:
+            break
+    if limit:
+        order = order[:limit]
+
+    got_caps_multi = [clips[g]["captions"] for g in order]
+    if not limit:
+        assert len(got_caps_multi) == len(ref_caps_multi), \
+            f"pool mismatch: streamed {len(got_caps_multi)} clips vs index {len(ref_caps_multi)}"
+        assert got_caps_multi == ref_caps_multi, \
+            "caption groups differ from the eval shard's captions_multi — pool NOT identical"
+        print(f"pool identity verified: {len(order)} clips, caption groups equal")
+    else:
+        ref_caps_multi = got_caps_multi  # probe mode: score whatever was streamed
+
+    # ---- audio embeddings (decode -> CLAP sr mono -> get_audio_features) ----------
+    a_chunks = []
+    for i, g in enumerate(order):
+        a = clips[g]["audio"]
+        wav, _ = librosa.load(io.BytesIO(a["bytes"]), sr=clap_sr, mono=True)
+        feats = proc(audio=[wav], sampling_rate=clap_sr, return_tensors="pt")
+        with torch.no_grad():
+            emb = model.get_audio_features(**{k: v.to(dev) for k, v in feats.items()})
+        if not torch.is_tensor(emb):  # some transformers versions return an output object
+            emb = _unwrap_clap(emb, model.audio_projection, model.config.projection_dim)
+        a_chunks.append(torch.nn.functional.normalize(emb, dim=-1).cpu())
+        if (i + 1) % 100 == 0:
+            print(f"audio {i + 1}/{len(order)}")
+    audio_emb = torch.cat(a_chunks)
+
+    flat_caps, group_ids = flatten_caption_groups(ref_caps_multi)
+    t_chunks, bs = [], 64
+    for i in range(0, len(flat_caps), bs):
+        t = proc(text=flat_caps[i:i + bs], return_tensors="pt", padding=True,
+                 truncation=True)
+        with torch.no_grad():
+            emb = model.get_text_features(**{k: v.to(dev) for k, v in t.items()})
+        if not torch.is_tensor(emb):
+            emb = _unwrap_clap(emb, model.text_projection, model.config.projection_dim)
+        t_chunks.append(torch.nn.functional.normalize(emb, dim=-1).cpu())
+    text_emb = torch.cat(t_chunks)
+
+    rel = multicaption_relevance(group_ids, n_audio=len(order))
+    report = retrieval_report(audio_emb, text_emb, relevance=rel)
+    out = {"model": clap_repo, "revision": clap_rev, "eval_shard": eval_shard,
+           "source_dataset": f"{repo}:{split}", "n_clips": len(order),
+           "n_captions": len(flat_caps), "protocol": "min-rank-over-refs",
+           "pool_identity_asserted": not bool(limit), "limit": limit, **report}
+    with open(str(checkpoints_dir() / out_name), "w") as fh:
+        json.dump(out, fh, indent=2)
+    volume.commit()
+    print("CLAP_REPLAY:", json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
+                                      for k, v in out.items()}, indent=1))
     return out
 
 
@@ -4817,7 +4948,7 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                        d_resampler=256, n_query=64, fn_mask_threshold=0.0,
                        soft_label_beta=0.0, text_cache_tag="", num_workers=4,
                        train_max_frames=250, init_from_ckpt="", recaption=False,
-                       adapter_rank=0, skip_only=False) -> dict:
+                       adapter_rank=0, skip_only=False, seed=-1) -> dict:
     import glob
     import itertools
     import json
@@ -4885,11 +5016,18 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
         # A live text forward inside the trainer's adapter scope would ADAPT the frozen
         # text targets (encode_text hard-fails on it) — adapters require the text cache.
         raise ValueError("adapter_rank > 0 requires use_text_cache=True")
+    # seed >= 0: deterministic init/shuffle for A/B seed-variance arms; the default
+    # (-1) preserves the historical unseeded behavior byte-for-byte.
+    if int(seed) >= 0:
+        from fusion_embedding.train_stage1 import set_seed
+        set_seed(int(seed))
+        print(f"SEED: all RNGs seeded with {int(seed)}")
     cfg0 = FusionConfig(n_query=int(n_query), d_resampler=int(d_resampler),
                         fn_mask_threshold=float(fn_mask_threshold),
                         soft_label_beta=float(soft_label_beta),
                         lambda_coral=lambda_coral, max_steps=steps,
                         adapter_rank=int(adapter_rank),
+                        seed=max(int(seed), 0),
                         **lr_kw)
     cfg, embed_tokens, base_lm, tokenizer = load_base(
         cfg0, device=dev, dtype=torch.bfloat16, load_in_4bit=load_in_4bit,
@@ -4971,7 +5109,9 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
         # order keeps randomization adequate at ~4.6GB/worker.
         train_ds = ShardedFrameDataset(shard_paths, shard_starts,
                                        exclude=set(eval_gidx) | recap_skip,
-                                       shuffle_buffer=1024, seed=0, use_text_emb=use_text_cache,
+                                       shuffle_buffer=1024,
+                                       seed=max(int(seed), 0),
+                                       use_text_emb=use_text_cache,
                                        text_emb_tag=text_cache_tag,
                                        max_frames=int(train_max_frames),
                                        captions_override=recap_override or None)
@@ -5053,7 +5193,8 @@ def _train_frames_impl(frame_shard, steps, batch_size, eval_size, lambda_coral,
                   f"|lr{peak_lr or cfg.lr}|bank{int(bank_negatives)}|4bit{int(load_in_4bit)}"
                   f"|wh{int(whiten_text)}|fn{cfg.fn_mask_threshold}|sl{cfg.soft_label_beta}"
                   f"|tc{text_cache_tag}|init{init_from_ckpt}|recap{int(recaption)}"
-                  f"|ar{int(adapter_rank)}|sk{int(skip_only)}")
+                  f"|ar{int(adapter_rank)}|sk{int(skip_only)}"
+                  + (f"|seed{int(seed)}" if int(seed) >= 0 else ""))
     start_step = load_resume_ckpt(resume_path, model, opt, sched, total_steps=steps,
                                   config_key=resume_key)
     print(f"RESUME: continuing from step {start_step}/{steps}" if start_step > 0

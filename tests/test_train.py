@@ -316,3 +316,39 @@ def test_single_train_step_updates_only_connector():
     for comp in model.frozen_modules():
         for p in comp.parameters():
             assert p.grad is None
+
+
+# ---------------------------------------------------------------------------- #
+# Seed reproducibility (multi-seed A/B arms depend on this contract)
+# ---------------------------------------------------------------------------- #
+def _first_step_state(seed: int):
+    """Build the tiny setup at ``seed`` and take one optimizer step; return the
+    first-batch loss and a trainable-param fingerprint after the step."""
+    from fusion_embedding.train_stage1 import build_tiny_training_setup
+
+    cfg = FusionConfig.tiny(max_steps=4, d_resampler=32)
+    s = build_tiny_training_setup(cfg, n_train=8, batch_size=8, seed=seed)
+    opt = build_optimizer(s.model, cfg)
+    batch = next(iter(s.train_loader))
+    out = s.model(batch)
+    loss, _metrics = s.loss_fn(out["audio"], out["text"], out["logit_scale"],
+                               out.get("hard_neg_text"))
+    loss.backward()
+    opt.step()
+    fp = torch.cat([p.detach().flatten() for p in s.model.trainable_parameters()])
+    return float(loss), fp
+
+
+def test_same_seed_reproduces_first_step():
+    loss_a, fp_a = _first_step_state(seed=1)
+    loss_b, fp_b = _first_step_state(seed=1)
+    assert loss_a == loss_b
+    assert torch.equal(fp_a, fp_b)
+
+
+def test_different_seeds_diverge():
+    loss_a, fp_a = _first_step_state(seed=1)
+    loss_b, fp_b = _first_step_state(seed=2)
+    # different init + shuffle: the first-step loss and the resulting trainables differ
+    assert loss_a != loss_b
+    assert not torch.equal(fp_a, fp_b)
