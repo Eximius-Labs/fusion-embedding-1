@@ -157,6 +157,13 @@ class FusionEmbedder:
     @torch.no_grad()
     def embed_image(self, image, dim: Optional[int] = None) -> torch.Tensor:
         from PIL import Image
+        gate = getattr(self.model, "_adapter_gate", None)
+        if gate is not None and gate.active:
+            # The vision path runs through the same (hook-carrying) decoder layers;
+            # non-audio inputs must execute with the gate closed so the adapter
+            # branch never runs. Mirrors the encode_text guard.
+            raise RuntimeError("adapter gate is open during an image embed — "
+                               "non-audio inputs must run with the gate closed")
         if isinstance(image, (str, os.PathLike)):
             image = Image.open(str(image))
         image = image.convert("RGB")

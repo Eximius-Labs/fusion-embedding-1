@@ -1186,11 +1186,27 @@ def fe2_hub_smoke(repo: str = "EximiusLabs/fusion-embedding-2-2b-preview",
 
     sims = {"t1_t1": float(t1 @ t1), "t1_t2": float(t1 @ t2),
             "a_t1": float(a @ t1), "i_t1": float(i @ t1)}
+
+    # Output-equality check on the released artifact: with the gate closed the
+    # hook returns None before any adapter arithmetic, so removing the hooks
+    # entirely must not change a single bit of the text/image outputs. This is
+    # the exact-preservation property verified end-to-end through the public
+    # loading path.
+    t1_hooked = fe.embed_text("a dog barks in the distance")
+    i_hooked = fe.embed_image(img)
+    for h in fe.model._adapter_handles:
+        h.remove()
+    t1_plain = fe.embed_text("a dog barks in the distance")
+    i_plain = fe.embed_image(img)
+    eq_text = bool(torch.equal(torch.as_tensor(t1_hooked), torch.as_tensor(t1_plain)))
+    eq_image = bool(torch.equal(torch.as_tensor(i_hooked), torch.as_tensor(i_plain)))
+
     out = {"repo": repo, "adapter_params": n_ad,
            "dims": {"text": list(t1.shape), "audio": list(a.shape), "image": list(i.shape)},
            "sims": {k: round(v, 4) for k, v in sims.items()},
+           "bitwise_equal": {"text": eq_text, "image": eq_image},
            "ok": bool(abs(sims["t1_t1"] - 1.0) < 1e-4 and sims["t1_t2"] < 0.99
-                      and t1.shape == a.shape == i.shape)}
+                      and t1.shape == a.shape == i.shape and eq_text and eq_image)}
     print("FE2_HUB_SMOKE:", out)
     assert out["ok"], "smoke checks failed"
     return out

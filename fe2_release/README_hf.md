@@ -56,9 +56,9 @@ base's text→image retrieval scores to four decimal places). Trained on 518K
 audio–caption pairs with a full-corpus frozen-text negative bank, it leads every
 unified embedding model we measured on audio↔text retrieval — ahead of ImageBind,
 LanguageBind, and Gemini Embedding 2 in both directions — and improves on
-fusion-embedding-1 v0.3 in 9 of 12 measured cells, with the largest gains in
-text→audio search. Audio↔image alignment is emergent (zero audio–image pairs in
-training).
+fusion-embedding-1 v0.3 in 8 of 12 release-protocol cells, including every
+recorded text→audio direction. Audio↔image alignment is emergent (zero
+audio–image pairs in training).
 
 | Feature | Value |
 | --- | --- |
