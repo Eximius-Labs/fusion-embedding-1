@@ -18,7 +18,7 @@ vision-language embedding base with audio — without modifying a single base we
 
 ## What is Fusion Embedding?
 
-Fusion Embedding is a family of open-weight embedding models that map **five
+Fusion Embedding is a family of open-weight embedding models that map **four
 modalities into a single shared vector space**, built for retrieval, RAG,
 clustering, and cross-modal search — and designed to be **fully self-hostable**.
 Two architecture generations are released:
@@ -48,8 +48,8 @@ base — so you inherit the base's retrieval quality exactly, and add audio on t
 
 ## Highlights
 
-- **Five modalities, one space** — text, image, video, audio, and PDF in a
-  single vector space, designed for retrieval in any direction between modalities.
+- **Four modalities, one space** — text, image, video, and audio in a single
+  vector space, designed for retrieval in any direction between modalities.
 - **Frozen-base architecture** — only audio-side components and a temperature are
   trained (a ~16M-parameter connector in generation 1; 60.6M including gated
   adapters in generation 2 — still ~2.3% of the stack). The base is never
