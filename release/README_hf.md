@@ -87,7 +87,7 @@ ranking, per-modality mean-centering of the gallery is recommended (`FusionEmbed
 ### Cross-modal retrieval — versus unified embedding models
 
 <p align="center">
-<img src="assets/fe_positioning.png" alt="Positioning: VGGSound-696 cross-modal retrieval versus model parameters; the fusion-embedding family leads unified models on audio-text and leads the emergent audio-image cluster (ImageBind's supervised pair annotated)" width="860px">
+<img src="assets/fe_positioning.png" alt="Positioning: VGGSound-696 cross-modal retrieval versus trained parameters; the fusion-embedding family leads unified models on audio-text and leads the emergent audio-image cluster (ImageBind's supervised pair annotated)" width="860px">
 </p>
 
 VGGSound-AV, 696 audio/video-frame pairs (chance R@10 = 0.014). R@10 shown as

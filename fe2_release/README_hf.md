@@ -89,7 +89,7 @@ All numbers below use the release protocol (bf16 base precision, native chat-tem
 text). Bold marks the better value per row/column.
 
 <p align="center">
-<img src="assets/fe_positioning.png" alt="Positioning: VGGSound-696 cross-modal retrieval versus model parameters; the fusion-embedding family leads unified models on audio-text and leads the emergent audio-image cluster (ImageBind's supervised pair annotated)" width="860px">
+<img src="assets/fe_positioning.png" alt="Positioning: VGGSound-696 cross-modal retrieval versus trained parameters; the fusion-embedding family leads unified models on audio-text and leads the emergent audio-image cluster (ImageBind's supervised pair annotated)" width="860px">
 </p>
 
 <details open>
