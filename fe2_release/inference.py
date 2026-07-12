@@ -15,7 +15,7 @@ this formatting, so use the templates provided here rather than constructing you
     fe = FusionEmbedder.from_pretrained("EximiusLabs/fusion-embedding-2-2b-preview")
     a, t, i = fe.embed_audio("dog.wav"), fe.embed_text("a dog barks"), fe.embed_image("dog.jpg")
 
-Requires: fusion_embedding (pip install git+https://github.com/Eximius-Labs/fusion-embedding-1),
+Requires: fusion_embedding (pip install git+https://github.com/Eximius-Labs/fusion-embedding),
 transformers>=4.46, torchvision, pillow, soundfile, librosa.
 """
 

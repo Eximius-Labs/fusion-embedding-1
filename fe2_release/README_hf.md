@@ -18,11 +18,11 @@ base_model: Qwen/Qwen3-VL-Embedding-2B
 
 <div align="center">
 
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://github.com/Eximius-Labs/fusion-embedding-1)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://github.com/Eximius-Labs/fusion-embedding-1)
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://github.com/Eximius-Labs/fusion-embedding)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://github.com/Eximius-Labs/fusion-embedding)
 [![Weights](https://img.shields.io/badge/weights-CC--BY--NC--4.0-green.svg)](#license)
 [![Status](https://img.shields.io/badge/status-research%20preview%20v0.1-orange.svg)](#)
-[![Code](https://img.shields.io/badge/code-GitHub-black.svg)](https://github.com/Eximius-Labs/fusion-embedding-1)
+[![Code](https://img.shields.io/badge/code-GitHub-black.svg)](https://github.com/Eximius-Labs/fusion-embedding)
 
 </div>
 
@@ -33,7 +33,7 @@ capacity added to a byte-frozen base. For the first-generation architecture, see
 [fusion-embedding-1-2b-preview](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview)
 (that line is final at v0.3).
 
-[GitHub](https://github.com/Eximius-Labs/fusion-embedding-1) | [fusion-embedding-1](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview) | Technical report: in preparation
+[GitHub](https://github.com/Eximius-Labs/fusion-embedding) | [fusion-embedding-1](https://huggingface.co/EximiusLabs/fusion-embedding-1-2b-preview) | Technical report: in preparation
 
 ## Model Overview
 
@@ -103,7 +103,7 @@ text). Bold marks the better value per row/column.
 | AudioCaps T→A R@10 | 0.746 | **0.775** |
 | Clotho (zero-shot) A→T R@1 | **0.135** | 0.127 |
 | Clotho (zero-shot) A→T R@10 | **0.433** | 0.421 |
-| Clotho (zero-shot) T→A R@1 | ~0.13 | **0.151** |
+| Clotho (zero-shot) T→A R@1 | 0.136 | **0.151** |
 | Clotho (zero-shot) T→A R@10 | 0.460 | **0.482** |
 | VGGSound audio→text R@1 | **0.213** | 0.211 |
 | VGGSound audio→text R@10 | 0.625 | **0.665** |
@@ -167,7 +167,7 @@ in the text→audio direction on every board.
 <details>
   <summary>Requirements</summary>
 
-- `fusion_embedding` package: `pip install git+https://github.com/Eximius-Labs/fusion-embedding-1`
+- `fusion_embedding` package: `pip install git+https://github.com/Eximius-Labs/fusion-embedding`
 - `transformers>=4.46`, `torch` (CUDA), `torchvision`, `pillow`, `soundfile`, `librosa`
 - ~14 GB GPU memory at bf16
 
@@ -217,7 +217,7 @@ gallery = FusionEmbedder.center(gallery_embeddings)
 
 ## License
 
-Code is Apache-2.0 ([GitHub](https://github.com/Eximius-Labs/fusion-embedding-1));
+Code is Apache-2.0 ([GitHub](https://github.com/Eximius-Labs/fusion-embedding));
 model weights in this repository are **CC BY-NC 4.0** (research preview). The frozen
 base and audio tower retain their original licenses.
 

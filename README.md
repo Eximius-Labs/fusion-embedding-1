@@ -1,8 +1,8 @@
 <div align="center">
 
-![Fusion Embedding, by Eximius Labs](assets/banner.png)
+![Fusion Embedding, by Eximius Labs](assets/git_banner.png)
 
-**One model. One vector space. Text, image, video, audio — and PDF.**
+**One model. One vector space. Text, image, video, audio.**
 
 *An open-weight multimodal embedding model that extends a state-of-the-art
 vision-language embedding base with audio — without modifying a single base weight.*
@@ -427,11 +427,11 @@ fully testable without hardware.
 - [x] **P0 — Infrastructure**: frozen-base wiring, eval harness, CPU-testable pipeline
 - [x] **P1 — Audio→text alignment**: connector training at scale, published-protocol
       eval wired into every run; shipped as
-      [v0.1-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.1-preview)
+      [v0.1-preview](https://github.com/Eximius-Labs/fusion-embedding/releases/tag/v0.1-preview)
       (131K pairs) and
-      [v0.2-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.2-preview)
+      [v0.2-preview](https://github.com/Eximius-Labs/fusion-embedding/releases/tag/v0.2-preview)
       (484K pairs — AudioCaps A→T R@10 0.626 → 0.717, Clotho zero-shot 0.252 → 0.448), and
-      [v0.3-preview](https://github.com/Eximius-Labs/fusion-embedding-1/releases/tag/v0.3-preview)
+      [v0.3-preview](https://github.com/Eximius-Labs/fusion-embedding/releases/tag/v0.3-preview)
       (AudioCaps in-domain fine-tune stage — A→T R@1 0.279 → 0.332, R@10 0.717 → 0.741)
 - [x] **P2 — Architecture generation 2**: corpus extended to 592K (FreeSound tail +
       BBC Sound Effects) with 73,716 no-sound-content clips excluded; relevance-aware
@@ -475,7 +475,7 @@ Matryoshka Representation Learning, and the audio-caption data ecosystem
             Image, Video, and Audio},
   author = {Tonmoy, Abdul Basit},
   year   = {2026},
-  url    = {https://github.com/Eximius-Labs/fusion-embedding-1}
+  url    = {https://github.com/Eximius-Labs/fusion-embedding}
 }
 
 @software{fusion_embedding_2_2026,
@@ -483,6 +483,6 @@ Matryoshka Representation Learning, and the audio-caption data ecosystem
             Image, Video, and Audio with Modality-Gated Deep Adapters},
   author = {Tonmoy, Abdul Basit},
   year   = {2026},
-  url    = {https://github.com/Eximius-Labs/fusion-embedding-1}
+  url    = {https://github.com/Eximius-Labs/fusion-embedding}
 }
 ```
