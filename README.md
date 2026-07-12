@@ -106,7 +106,7 @@ an ImageBind comparison).
 
 ## Architecture
 
-![Fusion Embedding architecture: frozen Qwen3-VL-Embedding base and frozen Qwen2.5-Omni audio tower; only the FusionResampler is trained](assets/architecture.png)
+![The Fusion Embedding family: both generations share the byte-frozen Qwen3-VL-Embedding-2B decoder and frozen Qwen2.5-Omni audio tower; generation 1 trains the FusionResampler (16.4M), generation 2 adds modality-gated adapters (+44.2M) that fire only on audio, with non-audio inputs bypassing bitwise-identically](assets/fe_family_architecture.png)
 
 The **FusionResampler** is a Flamingo-style perceiver resampler running at a
 384-d bottleneck: `in_proj 3584→384` → N=64 learnable latent queries through
@@ -308,7 +308,7 @@ CLAP-family models that fine-tune both encoders end-to-end score higher on Audio
 fusion-embedding models train on audio–text only — their audio↔image alignment is
 emergent):
 
-![Unified-model positioning: VGGSound-696 cross-modal retrieval, R@10 averaged over both directions, versus model parameters — the fusion-embedding family leads audio↔text over LanguageBind, ImageBind, and Gemini Embedding 2, and leads the emergent audio↔image cluster (ImageBind's supervised pair annotated)](assets/fe_positioning.png)
+![Unified-model positioning: VGGSound-696 cross-modal retrieval, R@10 averaged over both directions, versus trained parameters — the fusion-embedding family leads audio↔text over LanguageBind, ImageBind, and Gemini Embedding 2, and leads the emergent audio↔image cluster (ImageBind's supervised pair annotated)](assets/fe_positioning.png)
 
 | Model | audio↔image | audio↔text | text↔image |
 |---|---|---|---|
