@@ -99,7 +99,7 @@ text). Bold marks the better value per row/column.
 |---|---|---|
 | AudioCaps A→T R@1 | **0.332** | 0.302 |
 | AudioCaps A→T R@10 | 0.741 | **0.743** |
-| AudioCaps T→A R@1 | — | **0.292** |
+| AudioCaps T→A R@1 | 0.280 | **0.292** |
 | AudioCaps T→A R@10 | 0.746 | **0.775** |
 | Clotho (zero-shot) A→T R@1 | **0.135** | 0.127 |
 | Clotho (zero-shot) A→T R@10 | **0.433** | 0.421 |
