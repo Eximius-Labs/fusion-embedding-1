@@ -290,6 +290,7 @@ mteb_image = (
                    ignore=["**/.git/**", "**/.venv/**", "**/tests/**",
                            "**/docs/**", "**/__pycache__/**"])
     .run_commands("pip install '/root/mteb-src[audio,image]'")
+    .add_local_dir("release/remote_code", "/root/remote_code")
 )
 
 
@@ -378,3 +379,97 @@ def wrapper_smoke() -> dict:
     print("WRAPPER_SMOKE:", out)
     assert out["ok"], "wrapper routing smoke failed"
     return out
+
+
+# --------------------------------------------------------------------------- #
+# parity smoke: the native video preprocessing vs the previous implementation
+# (loaded from the pinned old Hub revision) and vs the raw base, bitwise.
+# --------------------------------------------------------------------------- #
+OLD_MODELING = {
+    FE1: "f1a36c5e52b06058c40454c4b1c553b61374f4f7",
+    FE2: "85b38b4a11c22268a48ae15f9202fcf5f57cd602",
+}
+
+
+def _parity(repo: str, gen: int, check_gate: bool) -> dict:
+    import os as _os
+
+    # the old implementation reads this at first use (lru-cached): force the
+    # same decoder backend the native path uses, so path inputs are comparable
+    _os.environ["FORCE_QWENVL_VIDEO_READER"] = "torchcodec"
+
+    import torch
+    from transformers import AutoModel
+
+    frames = _synth_frames()
+    mp4 = _synth_mp4(frames)
+
+    m_new = AutoModel.from_pretrained(_local_repo_dir(repo, gen),
+                                      trust_remote_code=True).to("cuda").eval()
+    m_old = AutoModel.from_pretrained(repo, revision=OLD_MODELING[repo],
+                                      trust_remote_code=True).to("cuda").eval()
+
+    out = {"repo": repo}
+
+    # (a1) frame-sequence input: new native vs old qwen-vl-utils, same frames
+    v_new_list = m_new.embed_video(frames)
+    v_old_list = m_old.embed_video(frames)
+    out["a1_bitwise_frames_old_vs_new"] = bool(torch.equal(v_new_list, v_old_list))
+
+    # (a2) file-path input: new native torchcodec vs old (torchcodec backend)
+    v_new_path = m_new.embed_video(mp4)
+    v_old_path = m_old.embed_video(mp4)
+    out["a2_bitwise_path_old_vs_new"] = bool(torch.equal(v_new_path, v_old_path))
+
+    # (b) raw base on identical inputs: the independent qwen-vl-utils manual
+    # replication (no new code involved) must equal the new frame-seq output
+    v_manual = _manual_base_video(m_new, frames)
+    out["b_bitwise_vs_raw_base"] = bool(torch.equal(v_new_list, v_manual))
+
+    # tensor input (the wrapper's path): same decoded frames as the path
+    # branch; equality with the path output holds iff metadata is inert
+    from torchcodec.decoders import VideoDecoder
+    dec = VideoDecoder(mp4)
+    total = dec.metadata.num_frames
+    idx = torch.linspace(0, total - 1, 4).round().long().tolist()  # matches 1fps/4s
+    t = dec.get_frames_at(indices=idx).data
+    v_new_tensor = m_new.embed_video(t)
+    out["tensor_input"] = {
+        "dims": list(v_new_tensor.shape),
+        "norm": round(float(v_new_tensor @ v_new_tensor), 6),
+        "bitwise_vs_path": bool(torch.equal(v_new_tensor, v_new_path)),
+    }
+
+    if check_gate:
+        try:
+            with m_new._rt["gate"]:
+                m_new.embed_video(t)
+            out["gate_guard_raises"] = False
+        except RuntimeError:
+            out["gate_guard_raises"] = True
+        v_h = m_new.embed_video(t)
+        for h in m_new._rt["adapter_handles"]:
+            h.remove()
+        out["bitwise_hooks_removed_video"] = bool(
+            torch.equal(v_h, m_new.embed_video(t)))
+
+    ok = (out["a1_bitwise_frames_old_vs_new"]
+          and out["a2_bitwise_path_old_vs_new"]
+          and out["b_bitwise_vs_raw_base"]
+          and abs(out["tensor_input"]["norm"] - 1.0) < 1e-4)
+    if check_gate:
+        ok = ok and out["gate_guard_raises"] and out["bitwise_hooks_removed_video"]
+    out["ok"] = bool(ok)
+    print("PARITY_SMOKE:", out)
+    assert out["ok"], "parity smoke failed"
+    return out
+
+
+@app.function(gpu="L4", image=mteb_image, secrets=[hf_secret], timeout=2400)
+def parity_fe1() -> dict:
+    return _parity(FE1, 1, check_gate=False)
+
+
+@app.function(gpu="L4", image=mteb_image, secrets=[hf_secret], timeout=2400)
+def parity_fe2() -> dict:
+    return _parity(FE2, 2, check_gate=True)

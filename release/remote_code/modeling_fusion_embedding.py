@@ -22,8 +22,9 @@ untouched), so text/image/video outputs are bit-for-bit those of generation 1 an
 base's computation path.
 
 Requires: transformers>=4.46 (with the Qwen2.5-Omni model classes), torchvision, pillow,
-soundfile, librosa; video embedding additionally requires qwen-vl-utils>=0.0.14 (the
-base model's own video preprocessing). A CUDA GPU is recommended (~14 GB at bf16).
+soundfile, librosa; embedding a video by file path additionally requires torchcodec
+(decoded frame tensors and frame sequences need nothing extra). A CUDA GPU is
+recommended (~14 GB at bf16).
 """
 
 from __future__ import annotations
@@ -245,6 +246,180 @@ class OmniAudioAdapter(nn.Module):
 # --------------------------------------------------------------------------- #
 # the AutoModel entry point
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# video preprocessing (native)
+#
+# Faithful reimplementation of the base model's reference video preprocessing
+# (the Qwen3-VL-Embedding scripts' vision pipeline at image_patch_size=16), so
+# no extra vision package is needed: frame selection, the per-frame image
+# resize applied to frame-sequence inputs, the per-video smart resize under the
+# total-pixel budget, and the processor kwargs (do_resize=False,
+# do_sample_frames=False, video_metadata) match the reference exactly; outputs
+# are verified bitwise-equal against the reference implementation on identical
+# inputs. Decoded-video inputs (frame tensors, file paths via torchcodec) take
+# the reference path-input treatment: a single per-video resize, no per-frame
+# image resize.
+# --------------------------------------------------------------------------- #
+_V_PATCH_FACTOR = 32                       # image_patch_size 16 x spatial merge 2
+_V_FRAME_FACTOR = 2
+_V_DEFAULT_FPS = 1.0
+_V_DEFAULT_MAX_FRAMES = 64
+_V_MIN_PIXELS = 128 * _V_PATCH_FACTOR ** 2           # per-frame floor
+_V_MAX_PIXELS = 768 * _V_PATCH_FACTOR ** 2           # per-frame ceiling
+_V_TOTAL_PIXELS = 10 * _V_MAX_PIXELS                 # per-video budget
+_V_IMG_MIN_PIXELS = 4 * _V_PATCH_FACTOR ** 2         # per-frame image defaults
+_V_IMG_MAX_PIXELS = 16384 * _V_PATCH_FACTOR ** 2
+_V_FPS_MIN_FRAMES = 4
+_V_MAX_RATIO = 200
+
+
+def _v_round(n: float, f: int) -> int:
+    return round(n / f) * f
+
+
+def _v_ceil(n: float, f: int) -> int:
+    return math.ceil(n / f) * f
+
+
+def _v_floor(n: float, f: int) -> int:
+    return math.floor(n / f) * f
+
+
+def _v_smart_resize(height: int, width: int, factor: int,
+                    min_pixels: int, max_pixels: int):
+    if max(height, width) / min(height, width) > _V_MAX_RATIO:
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than {_V_MAX_RATIO}, "
+            f"got {max(height, width) / min(height, width)}")
+    h_bar = max(factor, _v_round(height, factor))
+    w_bar = max(factor, _v_round(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = _v_floor(height / beta, factor)
+        w_bar = _v_floor(width / beta, factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = _v_ceil(height * beta, factor)
+        w_bar = _v_ceil(width * beta, factor)
+    return h_bar, w_bar
+
+
+def _v_frame_to_image(frame):
+    """Frame-sequence element -> resized RGB PIL image (reference fetch_image)."""
+    from PIL import Image
+
+    if isinstance(frame, (str, os.PathLike)):
+        image = Image.open(str(frame))
+    else:
+        image = frame
+    if image.mode == "RGBA":
+        white = Image.new("RGB", image.size, (255, 255, 255))
+        white.paste(image, mask=image.split()[3])
+        image = white
+    else:
+        image = image.convert("RGB")
+    width, height = image.size
+    rh, rw = _v_smart_resize(height, width, _V_PATCH_FACTOR,
+                             _V_IMG_MIN_PIXELS, _V_IMG_MAX_PIXELS)
+    return image.resize((rw, rh))
+
+
+def _v_prepare(video, fps, max_frames):
+    """Normalize any supported video input to (uint8 tensor [T,C,H,W], metadata).
+
+    Frame sequences follow the reference list-input treatment (per-frame image
+    resize, pad to an even count by repeating the last frame, synthetic
+    metadata at 2 fps). Frame tensors and file paths follow the reference
+    decoded-video treatment (frame selection only; single per-video resize).
+    """
+    import numpy as np
+
+    if isinstance(video, torch.Tensor):
+        if video.ndim != 4 or video.shape[1] not in (1, 3):
+            raise ValueError(
+                f"expected a [T, C, H, W] frame tensor, got {list(video.shape)}")
+        frames = video
+        if frames.shape[1] == 1:
+            frames = frames.expand(-1, 3, -1, -1)
+        if frames.dtype != torch.uint8:
+            frames = frames.clamp(0, 255).to(torch.uint8)
+        t = frames.shape[0]
+        mf = max_frames or _V_DEFAULT_MAX_FRAMES
+        if t > mf:
+            idx = np.linspace(0, t - 1, mf, dtype=int)
+            frames = frames[torch.as_tensor(idx.copy())]
+            t = mf
+        n = _v_ceil(t, _V_FRAME_FACTOR)
+        if t < n:
+            frames = torch.cat([frames, frames[-1:].expand(n - t, -1, -1, -1)])
+        metadata = dict(fps=2.0, frames_indices=list(range(n)),
+                        total_num_frames=float(n))
+        return frames, metadata
+
+    if isinstance(video, (str, os.PathLike)):
+        v = str(video)
+        if v.startswith("file://"):
+            v = v[7:]
+        try:
+            from torchcodec.decoders import VideoDecoder
+        except ImportError as e:
+            raise ImportError(
+                "embedding a video by file path requires torchcodec "
+                "(pip install torchcodec); alternatively pass decoded frames "
+                "(a [T, C, H, W] tensor or a list of PIL images)") from e
+        decoder = VideoDecoder(v)
+        video_fps = decoder.metadata.average_fps
+        total = decoder.metadata.num_frames
+        want_fps = fps or _V_DEFAULT_FPS
+        min_frames = _v_ceil(_V_FPS_MIN_FRAMES, _V_FRAME_FACTOR)
+        max_f = _v_floor(max_frames or _V_DEFAULT_MAX_FRAMES, _V_FRAME_FACTOR)
+        n = total / video_fps * want_fps
+        n = min(min(max(n, min_frames), max_f), total)
+        n = _v_floor(n, _V_FRAME_FACTOR)
+        if not (_V_FRAME_FACTOR <= n <= total):
+            raise ValueError(
+                f"video too short: {total} frames; need >= {_V_FRAME_FACTOR}")
+        idx = torch.linspace(0, total - 1, n).round().long().tolist()
+        frames = decoder.get_frames_at(indices=idx).data
+        metadata = dict(fps=video_fps, frames_indices=idx,
+                        total_num_frames=total, video_backend="torchcodec")
+        return frames, metadata
+
+    # frame sequence (PIL images and/or paths)
+    frames = list(video)
+    if not frames:
+        raise ValueError("empty frame sequence")
+    mf = max_frames or _V_DEFAULT_MAX_FRAMES
+    if len(frames) > mf:
+        idx = np.linspace(0, len(frames) - 1, mf, dtype=int)
+        frames = [frames[i] for i in idx]
+    images = [_v_frame_to_image(f) for f in frames]
+    n = _v_ceil(len(images), _V_FRAME_FACTOR)
+    if len(images) < n:
+        images.extend([images[-1]] * (n - len(images)))
+    tensor = torch.stack([
+        torch.from_numpy(np.array(image).transpose(2, 0, 1)) for image in images
+    ])
+    metadata = dict(fps=2.0, frames_indices=list(range(n)),
+                    total_num_frames=float(n))
+    return tensor, metadata
+
+
+def _v_resize_video(frames: torch.Tensor) -> torch.Tensor:
+    """Per-video smart resize under the total-pixel budget (reference exact)."""
+    from torchvision.transforms import InterpolationMode
+    from torchvision.transforms import functional as TF
+
+    n, _, height, width = frames.shape
+    max_pixels = max(min(_V_MAX_PIXELS, _V_TOTAL_PIXELS / n * _V_FRAME_FACTOR),
+                     int(_V_MIN_PIXELS * 1.05))
+    rh, rw = _v_smart_resize(height, width, _V_PATCH_FACTOR,
+                             _V_MIN_PIXELS, max_pixels)
+    return TF.resize(frames, [rh, rw],
+                     interpolation=InterpolationMode.BICUBIC,
+                     antialias=True).float()
+
+
 class FusionEmbeddingModel(PreTrainedModel):
     """fusion-embedding for transformers AutoModel (trust_remote_code).
 
@@ -447,20 +622,15 @@ class FusionEmbeddingModel(PreTrainedModel):
                     dim: Optional[int] = None) -> torch.Tensor:
         """Embed a video through the frozen base model's own video path.
 
-        ``video`` is a file path/URL, or a pre-extracted frame sequence (a list
-        of PIL images and/or frame-image paths). Preprocessing follows the base
-        model's official usage (the Qwen3-VL-Embedding reference scripts):
-        ``qwen_vl_utils.process_vision_info`` with ``image_patch_size=16``,
-        1 fps sampling up to 64 frames for path inputs, uniform temporal
-        sampling of frame sequences, a 7,864,320 total-pixel budget
-        (10 x 768 x 32 x 32), and ``do_resize=False`` at the processor because
-        the vision utility already smart-resizes. Like images, video is a
-        non-audio input: it takes the frozen path (no whitening, no adapters).
-        Path inputs additionally need a video decoder backend supported by
-        ``qwen_vl_utils`` (e.g. torchvision/decord); frame sequences do not.
+        ``video`` is a decoded frame tensor ([T, C, H, W], e.g. straight from
+        a torchcodec ``VideoDecoder``), a file path/URL (decoded with
+        torchcodec, 1 fps up to 64 frames), or a pre-extracted frame sequence
+        (PIL images and/or frame paths, sampled uniformly to 64).
+        Preprocessing natively reimplements the base model's reference
+        scripts (see the module-level helpers above); no extra vision package
+        is required. Like images, video is a non-audio input: it takes the
+        frozen path (no whitening, no adapters).
         """
-        import numpy as np
-
         self._ensure_backbones()
         if self._rt["gate"].active:
             # The video path runs through the same (hook-carrying) decoder
@@ -468,49 +638,13 @@ class FusionEmbeddingModel(PreTrainedModel):
             # the gate closed so the adapter branch never runs.
             raise RuntimeError("adapter gate is open during a video embed — "
                                "non-audio inputs must run with the gate closed")
-        try:
-            from qwen_vl_utils import process_vision_info
-        except ImportError as e:  # pragma: no cover - environment dependent
-            raise ImportError(
-                "video embedding uses the base model's own preprocessing "
-                "package: pip install 'qwen-vl-utils>=0.0.14'") from e
-
-        # Constants from the base's reference implementation.
-        video_total_pixels = 10 * 768 * 32 * 32
-        default_fps, default_max_frames = 1.0, 64
-
-        if isinstance(video, (str, os.PathLike)):
-            v = str(video)
-            content = v if v.startswith(("http://", "https://")) \
-                else "file://" + os.path.abspath(v)
-            vkw = {"fps": fps or default_fps,
-                   "max_frames": max_frames or default_max_frames,
-                   "total_pixels": video_total_pixels}
-        else:
-            frames = list(video)
-            if not frames:
-                raise ValueError("empty frame sequence")
-            mf = max_frames or default_max_frames
-            if len(frames) > mf:
-                # Uniform temporal sampling, as in the base's sample_frames.
-                idx = np.linspace(0, len(frames) - 1, mf, dtype=int)
-                frames = [frames[i] for i in idx]
-            content = ["file://" + os.path.abspath(str(f))
-                       if isinstance(f, (str, os.PathLike)) else f
-                       for f in frames]
-            vkw = {"total_pixels": video_total_pixels}
-
-        conversation = [{"role": "user",
-                         "content": [{"type": "video", "video": content, **vkw}]}]
-        _, video_inputs, video_kwargs = process_vision_info(
-            conversation, image_patch_size=16,
-            return_video_metadata=True, return_video_kwargs=True)
-        videos, video_metadata = zip(*video_inputs)
+        frames, metadata = _v_prepare(video, fps, max_frames)
+        frames = _v_resize_video(frames)
         text = _chat(DOC_INSTRUCTION, "<|vision_start|><|video_pad|><|vision_end|>")
-        inputs = self._rt["proc"](text=[text], videos=list(videos),
-                                  video_metadata=list(video_metadata),
-                                  do_resize=False, return_tensors="pt",
-                                  **video_kwargs).to(self._device)
+        inputs = self._rt["proc"](text=[text], videos=[frames],
+                                  video_metadata=[metadata],
+                                  do_resize=False, do_sample_frames=False,
+                                  return_tensors="pt").to(self._device)
         h = self._rt["full"](**inputs).last_hidden_state
         pooled = last_token_pool(h, inputs["attention_mask"])
         return self._finish(pooled, dim)
