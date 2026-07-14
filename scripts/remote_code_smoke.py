@@ -262,3 +262,119 @@ def smoke_fe1_local() -> dict:
 def smoke_fe2_local() -> dict:
     return _smoke(FE2, "/root/fe2_inference.py", check_hooks_removed=True,
                   local_gen=2)
+
+
+# --------------------------------------------------------------------------- #
+# mteb wrapper routing smoke: the end-user path through mteb.get_model with
+# synthetic datasets covering audio / video / image / text / fused routing.
+# Installs mteb from the local PR checkout baked into the image.
+# --------------------------------------------------------------------------- #
+mteb_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg", "libsndfile1")
+    .pip_install(
+        "torch==2.6.0",
+        "torchvision==0.21.0",
+        "torchcodec==0.2.1",
+        "numpy>=1.24",
+        "transformers>=4.46",
+        "accelerate>=0.30",
+        "soundfile>=0.12",
+        "librosa>=0.10",
+        "pillow>=10.0",
+        "qwen-vl-utils>=0.0.14",
+        "av>=12",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
+    .add_local_dir("D:/oss/.tmp/mteb-pr", "/root/mteb-src", copy=True,
+                   ignore=["**/.git/**", "**/.venv/**", "**/tests/**",
+                           "**/docs/**", "**/__pycache__/**"])
+    .run_commands("pip install '/root/mteb-src[audio,image]'")
+)
+
+
+@app.function(gpu="L4", image=mteb_image, secrets=[hf_secret], timeout=2400)
+def wrapper_smoke() -> dict:
+    import subprocess
+
+    import numpy as np
+    import soundfile as sf
+    from datasets import Audio as DsAudio
+    from datasets import Dataset
+    from datasets import Image as DsImage
+    from datasets import Video as DsVideo
+    from torch.utils.data import DataLoader
+
+    import mteb
+    from mteb._create_dataloaders import _custom_collate_fn
+
+    frames = _synth_frames()
+
+    # synthetic assets on disk (2 of each; deterministic)
+    rng = np.random.default_rng(3)
+    wavs, mp4s, pngs = [], [], []
+    for i in range(2):
+        w = f"/tmp/w{i}.wav"
+        sf.write(w, (rng.standard_normal(16000 * 3) * 0.05).astype("float32"),
+                 16000)
+        wavs.append(w)
+        d = f"/tmp/f{i}"
+        subprocess.run(["mkdir", "-p", d], check=True)
+        for j, fr in enumerate(frames):
+            fr.rotate(i * 15).save(f"{d}/{j:03d}.png")
+        m = f"/tmp/v{i}.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate",
+                        "4", "-i", f"{d}/%03d.png", "-pix_fmt", "yuv420p", m],
+                       check=True)
+        mp4s.append(m)
+        p = f"/tmp/i{i}.png"
+        frames[i * 5].save(p)
+        pngs.append(p)
+    texts = ["a dog barks in the rain", "a train passes over a bridge"]
+
+    def dl(ds):
+        return DataLoader(ds, batch_size=2, collate_fn=_custom_collate_fn)
+
+    def enc(model, ds):
+        return model.encode(dl(ds), task_metadata=None, hf_split="test",
+                            hf_subset="default")
+
+    model = mteb.get_model("EximiusLabs/fusion-embedding-1-2b-preview")
+
+    ds_text = Dataset.from_dict({"text": texts})
+    ds_audio = Dataset.from_dict({"audio": wavs}).cast_column("audio", DsAudio())
+    ds_image = Dataset.from_dict({"image": pngs}).cast_column("image", DsImage())
+    ds_video = Dataset.from_dict({"video": mp4s}).cast_column("video", DsVideo())
+    ds_ti = Dataset.from_dict({"text": texts, "image": pngs}).cast_column(
+        "image", DsImage())
+    ds_av = Dataset.from_dict({"audio": wavs, "video": mp4s}).cast_column(
+        "audio", DsAudio()).cast_column("video", DsVideo())
+
+    e_text = enc(model, ds_text)
+    e_audio = enc(model, ds_audio)
+    e_image = enc(model, ds_image)
+    e_video = enc(model, ds_video)
+    e_ti = enc(model, ds_ti)
+    e_av = enc(model, ds_av)
+
+    out = {
+        "shapes": {k: list(v.shape) for k, v in
+                   (("text", e_text), ("audio", e_audio), ("image", e_image),
+                    ("video", e_video), ("fused_ti", e_ti),
+                    ("fused_av", e_av))},
+        "norms_unit": {
+            "text": bool(np.allclose(np.linalg.norm(e_text, axis=1), 1, atol=1e-4)),
+            "audio": bool(np.allclose(np.linalg.norm(e_audio, axis=1), 1, atol=1e-4)),
+            "image": bool(np.allclose(np.linalg.norm(e_image, axis=1), 1, atol=1e-4)),
+            "video": bool(np.allclose(np.linalg.norm(e_video, axis=1), 1, atol=1e-4)),
+        },
+        # fused must equal the elementwise sum of the single-modality passes
+        "fused_ti_equals_sum": bool(np.array_equal(e_ti, e_image + e_text)),
+        "fused_av_equals_sum": bool(np.array_equal(e_av, e_audio + e_video)),
+    }
+    out["ok"] = (all(v == [2, 1024] for v in out["shapes"].values())
+                 and all(out["norms_unit"].values())
+                 and out["fused_ti_equals_sum"] and out["fused_av_equals_sum"])
+    print("WRAPPER_SMOKE:", out)
+    assert out["ok"], "wrapper routing smoke failed"
+    return out
