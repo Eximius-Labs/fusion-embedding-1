@@ -173,6 +173,80 @@ class FusionEmbedder:
         pooled = self._pool(h, inputs["attention_mask"])
         return self._finish(pooled, dim)
 
+    # ------------------------------------------------------------------ video
+    @torch.no_grad()
+    def embed_video(self, video, fps: Optional[float] = None,
+                    max_frames: Optional[int] = None,
+                    dim: Optional[int] = None) -> torch.Tensor:
+        """Embed a video through the frozen base model's own video path.
+
+        ``video`` is a file path/URL, or a pre-extracted frame sequence (a list of
+        PIL images and/or frame-image paths). Preprocessing follows the base model's
+        official usage (the Qwen3-VL-Embedding reference scripts):
+        ``qwen_vl_utils.process_vision_info`` with ``image_patch_size=16``, 1 fps
+        sampling up to 64 frames for path inputs, uniform temporal sampling of frame
+        sequences, a 7,864,320 total-pixel budget, and ``do_resize=False`` at the
+        processor because the vision utility already smart-resizes. Like images,
+        video is a non-audio input and takes the frozen path (no whitening, no
+        adapters). Requires qwen-vl-utils>=0.0.14; path inputs additionally need a
+        video decoder backend supported by it.
+        """
+        import numpy as np
+
+        gate = getattr(self.model, "_adapter_gate", None)
+        if gate is not None and gate.active:
+            # The video path runs through the same (hook-carrying) decoder layers;
+            # non-audio inputs must run with the gate closed so the adapter branch
+            # never runs. Mirrors the encode_text/embed_image guards.
+            raise RuntimeError("adapter gate is open during a video embed — "
+                               "non-audio inputs must run with the gate closed")
+        try:
+            from qwen_vl_utils import process_vision_info
+        except ImportError as e:
+            raise ImportError(
+                "video embedding uses the base model's own preprocessing "
+                "package: pip install 'qwen-vl-utils>=0.0.14'") from e
+
+        # Constants from the base's reference implementation.
+        video_total_pixels = 10 * 768 * 32 * 32
+        default_fps, default_max_frames = 1.0, 64
+
+        if isinstance(video, (str, os.PathLike)):
+            v = str(video)
+            content = v if v.startswith(("http://", "https://")) \
+                else "file://" + os.path.abspath(v)
+            vkw = {"fps": fps or default_fps,
+                   "max_frames": max_frames or default_max_frames,
+                   "total_pixels": video_total_pixels}
+        else:
+            frames = list(video)
+            if not frames:
+                raise ValueError("empty frame sequence")
+            mf = max_frames or default_max_frames
+            if len(frames) > mf:
+                # Uniform temporal sampling, as in the base's sample_frames.
+                idx = np.linspace(0, len(frames) - 1, mf, dtype=int)
+                frames = [frames[i] for i in idx]
+            content = ["file://" + os.path.abspath(str(f))
+                       if isinstance(f, (str, os.PathLike)) else f
+                       for f in frames]
+            vkw = {"total_pixels": video_total_pixels}
+
+        conversation = [{"role": "user",
+                         "content": [{"type": "video", "video": content, **vkw}]}]
+        _, video_inputs, video_kwargs = process_vision_info(
+            conversation, image_patch_size=16,
+            return_video_metadata=True, return_video_kwargs=True)
+        videos, video_metadata = zip(*video_inputs)
+        text = _chat(DOC_INSTRUCTION, "<|vision_start|><|video_pad|><|vision_end|>")
+        inputs = self.proc(text=[text], videos=list(videos),
+                           video_metadata=list(video_metadata),
+                           do_resize=False, return_tensors="pt",
+                           **video_kwargs).to(self.device)
+        h = self.full(**inputs).last_hidden_state
+        pooled = self._pool(h, inputs["attention_mask"])
+        return self._finish(pooled, dim)
+
     # ------------------------------------------------------------------ cross-modal readout
     @staticmethod
     def center(embs: torch.Tensor) -> torch.Tensor:

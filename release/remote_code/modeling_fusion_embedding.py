@@ -1,6 +1,6 @@
 """HF remote-code modeling for the fusion-embedding family (AutoModel + trust_remote_code).
 
-One embedding space for text, images, and audio. The checkpoint on this repository holds
+One embedding space for text, images, video, and audio. The checkpoint on this repository holds
 ONLY the trained components (perceiver-resampler connector, diagonal text whitening,
 logit scale and — generation 2 — the modality-gated deep adapters); the frozen
 Qwen3-VL-Embedding-2B base and the frozen Qwen2.5-Omni audio tower are downloaded from
@@ -12,16 +12,18 @@ their own repositories on first use and are byte-identical to their releases.
     t = model.embed_text("a dog barks in the distance")
     a = model.embed_audio("dog.wav")
     i = model.embed_image("dog.jpg")
+    v = model.embed_video("dog.mp4")            # or a list of PIL frames
 
 The embed_* methods reproduce the repository's reference ``inference.py`` exactly (same
 chat templates, truncation, pooling, whitening, Matryoshka truncation and normalization);
 outputs are bitwise-identical to that loader on the same hardware. Non-audio inputs never
 execute the generation-2 adapter branch (the gate returns the frozen layers' output
-untouched), so text/image outputs are bit-for-bit those of generation 1 and of the base's
-computation path.
+untouched), so text/image/video outputs are bit-for-bit those of generation 1 and of the
+base's computation path.
 
 Requires: transformers>=4.46 (with the Qwen2.5-Omni model classes), torchvision, pillow,
-soundfile, librosa. A CUDA GPU is recommended (~14 GB at bf16).
+soundfile, librosa; video embedding additionally requires qwen-vl-utils>=0.0.14 (the
+base model's own video preprocessing). A CUDA GPU is recommended (~14 GB at bf16).
 """
 
 from __future__ import annotations
@@ -435,6 +437,80 @@ class FusionEmbeddingModel(PreTrainedModel):
         text = _chat(DOC_INSTRUCTION, "<|vision_start|><|image_pad|><|vision_end|>")
         inputs = self._rt["proc"](text=[text], images=[image],
                                   return_tensors="pt").to(self._device)
+        h = self._rt["full"](**inputs).last_hidden_state
+        pooled = last_token_pool(h, inputs["attention_mask"])
+        return self._finish(pooled, dim)
+
+    @torch.no_grad()
+    def embed_video(self, video, fps: Optional[float] = None,
+                    max_frames: Optional[int] = None,
+                    dim: Optional[int] = None) -> torch.Tensor:
+        """Embed a video through the frozen base model's own video path.
+
+        ``video`` is a file path/URL, or a pre-extracted frame sequence (a list
+        of PIL images and/or frame-image paths). Preprocessing follows the base
+        model's official usage (the Qwen3-VL-Embedding reference scripts):
+        ``qwen_vl_utils.process_vision_info`` with ``image_patch_size=16``,
+        1 fps sampling up to 64 frames for path inputs, uniform temporal
+        sampling of frame sequences, a 7,864,320 total-pixel budget
+        (10 x 768 x 32 x 32), and ``do_resize=False`` at the processor because
+        the vision utility already smart-resizes. Like images, video is a
+        non-audio input: it takes the frozen path (no whitening, no adapters).
+        Path inputs additionally need a video decoder backend supported by
+        ``qwen_vl_utils`` (e.g. torchvision/decord); frame sequences do not.
+        """
+        import numpy as np
+
+        self._ensure_backbones()
+        if self._rt["gate"].active:
+            # The video path runs through the same (hook-carrying) decoder
+            # layers as text and images; non-audio inputs must execute with
+            # the gate closed so the adapter branch never runs.
+            raise RuntimeError("adapter gate is open during a video embed — "
+                               "non-audio inputs must run with the gate closed")
+        try:
+            from qwen_vl_utils import process_vision_info
+        except ImportError as e:  # pragma: no cover - environment dependent
+            raise ImportError(
+                "video embedding uses the base model's own preprocessing "
+                "package: pip install 'qwen-vl-utils>=0.0.14'") from e
+
+        # Constants from the base's reference implementation.
+        video_total_pixels = 10 * 768 * 32 * 32
+        default_fps, default_max_frames = 1.0, 64
+
+        if isinstance(video, (str, os.PathLike)):
+            v = str(video)
+            content = v if v.startswith(("http://", "https://")) \
+                else "file://" + os.path.abspath(v)
+            vkw = {"fps": fps or default_fps,
+                   "max_frames": max_frames or default_max_frames,
+                   "total_pixels": video_total_pixels}
+        else:
+            frames = list(video)
+            if not frames:
+                raise ValueError("empty frame sequence")
+            mf = max_frames or default_max_frames
+            if len(frames) > mf:
+                # Uniform temporal sampling, as in the base's sample_frames.
+                idx = np.linspace(0, len(frames) - 1, mf, dtype=int)
+                frames = [frames[i] for i in idx]
+            content = ["file://" + os.path.abspath(str(f))
+                       if isinstance(f, (str, os.PathLike)) else f
+                       for f in frames]
+            vkw = {"total_pixels": video_total_pixels}
+
+        conversation = [{"role": "user",
+                         "content": [{"type": "video", "video": content, **vkw}]}]
+        _, video_inputs, video_kwargs = process_vision_info(
+            conversation, image_patch_size=16,
+            return_video_metadata=True, return_video_kwargs=True)
+        videos, video_metadata = zip(*video_inputs)
+        text = _chat(DOC_INSTRUCTION, "<|vision_start|><|video_pad|><|vision_end|>")
+        inputs = self._rt["proc"](text=[text], videos=list(videos),
+                                  video_metadata=list(video_metadata),
+                                  do_resize=False, return_tensors="pt",
+                                  **video_kwargs).to(self._device)
         h = self._rt["full"](**inputs).last_hidden_state
         pooled = last_token_pool(h, inputs["attention_mask"])
         return self._finish(pooled, dim)
