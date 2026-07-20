@@ -51,7 +51,9 @@ FE1_REPO = "EximiusLabs/fusion-embedding-1-2b-preview"
 FE1_REV = "b551ea8033bee3cd51468cbde2bb25397292e0b3"
 MIRROR = "jsonhash/LLVIP"
 
-# Class-prompt template variants. T1 is the pre-registered PRIMARY.
+# Single-prompt variants kept for transparency (they show the uncalibrated
+# 2-prompt argmax is brittle). The PRIMARY metric is now a prompt ENSEMBLE with
+# prior calibration -- standard CLIP zero-shot practice -- not a single prompt.
 TEMPLATES = {
     "T1_primary": ["a thermal infrared photo of a person",
                    "a thermal infrared photo of an empty street"],
@@ -59,6 +61,29 @@ TEMPLATES = {
                  "a photo of the background"],
     "T3_surveillance": ["an infrared surveillance image containing a pedestrian",
                         "an infrared surveillance image with no people"],
+}
+# Prompt ensemble: each class embedding is the renormalized mean over its
+# templates; the decision is calibrated by removing each class's prior over the
+# eval crops (the documented fix for prompt-prior bias, applied symmetrically to
+# both classes -- and, as the RGB ceiling confirms, needed by every modality,
+# not just thermal). This ensembled + calibrated accuracy is the GATED metric.
+ENSEMBLE = {
+    "person": [
+        "a thermal infrared photo of a person",
+        "an infrared image of a pedestrian",
+        "a thermal image showing a human figure",
+        "a person seen in thermal infrared",
+        "an infrared surveillance image containing a pedestrian",
+        "a thermal photo of a walking person",
+    ],
+    "background": [
+        "a thermal infrared photo of an empty street",
+        "an infrared image with no people",
+        "a thermal image of an empty road",
+        "an infrared surveillance image with no people",
+        "a thermal photo of buildings and pavement",
+        "an empty scene in thermal infrared",
+    ],
 }
 # Thermal framing we would inject on the image side if the released API exposed
 # an image-instruction param; it does not (embed_image hardcodes a fixed
@@ -332,12 +357,56 @@ def run_probe(limit: int = 0) -> dict:
         te = embed_texts([pos_t, neg_t])
         result["classification"][name] = _classify(pe, be, te)
 
-    # ---- (c) RGB ceiling: visible twins, same protocol ----
+    def _ensemble_emb(prompts):
+        """Renormalized mean of a class's prompt embeddings (CLIP-style)."""
+        e = embed_texts(prompts).mean(0, keepdim=True)
+        return e / e.norm(dim=1, keepdim=True)
+
+    def _classify_calibrated(pos_emb, neg_emb, class_te):
+        """PRIMARY gated metric: prompt-ensembled class embeddings + prior
+        calibration. The calibration subtracts each class column's mean logit
+        over the pooled crops, removing the constant per-prompt bias that
+        saturates a raw 2-prompt argmax. Reports both the ensembled raw argmax
+        (for transparency) and the calibrated accuracy (the gate)."""
+        sp = pos_emb @ class_te.T          # [n_person, 2]
+        sn = neg_emb @ class_te.T          # [n_bg, 2]
+        np_, nn_ = pos_emb.shape[0], neg_emb.shape[0]
+        raw = ((sp.argmax(1) == 0).float().sum()
+               + (sn.argmax(1) == 1).float().sum()) / (np_ + nn_)
+        bias = torch.cat([sp, sn], 0).mean(0, keepdim=True)
+        pc = ((sp - bias).argmax(1) == 0).float().mean().item()
+        bc = ((sn - bias).argmax(1) == 1).float().mean().item()
+        return {
+            "ensemble_raw_top1": round(raw.item() * 100, 2),
+            "acc_person_calibrated": round(pc, 4),
+            "acc_background_calibrated": round(bc, 4),
+            "top1_calibrated": round((pc * np_ + bc * nn_) / (np_ + nn_) * 100, 2),
+            "n_person_templates": len(ENSEMBLE["person"]),
+            "n_background_templates": len(ENSEMBLE["background"]),
+        }
+
+    class_te = torch.cat([_ensemble_emb(ENSEMBLE["person"]),
+                          _ensemble_emb(ENSEMBLE["background"])], 0)
+    result["classification"]["ENSEMBLE_calibrated_PRIMARY"] = \
+        _classify_calibrated(pe, be, class_te)
+
+    # ---- (c) RGB ceiling: visible twins, SAME ensembled+calibrated harness ----
+    # Fair control: identical calibration method, visible-light-worded prompts.
+    ENSEMBLE_RGB = {
+        "person": ["a photo of a person", "a photo of a pedestrian",
+                   "a street photo showing a person", "a person walking on a street",
+                   "a photograph of a human figure", "a picture of a person outdoors"],
+        "background": ["a photo of an empty street", "a photo of an empty road",
+                       "a street photo with no people", "a photograph of buildings and pavement",
+                       "an empty outdoor scene", "a picture of a street with no one in it"],
+    }
     vp, vb, _ = _build_crop_sets(ann_dir, vis_test, n_rgb, seed=0)
     vpe, vbe = embed_images(vp), embed_images(vb)
-    te = embed_texts(list(TEMPLATES["T2_plain"]))
-    rgb = _classify(vpe, vbe, te)
-    rgb["protocol"] = "T2_plain on visible-light twin crops"
+    rgb_te = torch.cat([_ensemble_emb(ENSEMBLE_RGB["person"]),
+                        _ensemble_emb(ENSEMBLE_RGB["background"])], 0)
+    rgb = _classify_calibrated(vpe, vbe, rgb_te)
+    rgb["single_prompt_T2"] = _classify(vpe, vbe, embed_texts(list(TEMPLATES["T2_plain"])))
+    rgb["protocol"] = "ensembled+calibrated on visible-light twin crops"
     rgb["n_per_class"] = len(vp)
     result["rgb_ceiling"] = rgb
 

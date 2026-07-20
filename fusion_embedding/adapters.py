@@ -120,6 +120,12 @@ def attach_gated_adapters(base_lm: nn.Module, d_model: int, rank: int,
     Returns ``(adapters, gate, handles)``. The caller MUST register ``adapters`` on a
     module OUTSIDE the frozen base (``FusionEmbeddingModel.audio_adapters``) so the
     RegressionGuard snapshot and the base's ``state_dict`` stay adapter-free.
+
+    Multiple packs compose: attaching a second pack (e.g. thermal) to the same layers
+    stacks a second gated hook per layer. Because every hook is a bitwise no-op while
+    its own gate is closed, packs are mutually invisible — a thermal encode (thermal
+    gate open, audio gate closed) fires only the thermal adapters, and any non-target
+    forward with all gates closed is bit-for-bit the frozen base. See ``AdapterPacks``.
     """
     layers = find_decoder_layers(base_lm)
     gate = AdapterGate()
@@ -127,3 +133,49 @@ def attach_gated_adapters(base_lm: nn.Module, d_model: int, rank: int,
     handles = [layer.register_forward_hook(_make_hook(ad, gate))
                for layer, ad in zip(layers, adapters)]
     return adapters, gate, handles
+
+
+class AdapterPacks(nn.Module):
+    """Named registry of independently-gated adapter packs on shared decoder layers.
+
+    Each pack is a full per-layer :class:`GatedAdapter` stack with its own
+    :class:`AdapterGate`; packs compose additively and are mutually invisible while
+    gated closed (see :func:`attach_gated_adapters`). This is the multi-modality
+    generalisation of the single audio pack: an audio pack and a thermal pack can
+    coexist on the same frozen base, each fired only for its own modality's encode.
+
+    LEGACY ALIAS: the ``"audio"`` pack is registered as the submodule ``audio_adapters``
+    (the same attribute a released FE2 audio checkpoint expects), so
+    ``load_state_dict`` on an audio-only checkpoint keeps working unchanged — a thermal
+    pack simply adds a new ``thermal_adapters`` key that old checkpoints lack (loaded
+    with ``strict=False`` or freshly built at identity).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._gates: dict[str, AdapterGate] = {}
+        self._handles: list = []
+
+    def add_pack(self, name: str, base_lm: nn.Module, d_model: int, rank: int,
+                 act: str = "silu") -> tuple[nn.ModuleList, AdapterGate]:
+        if name in self._gates:
+            raise ValueError(f"adapter pack {name!r} already registered")
+        adapters, gate, handles = attach_gated_adapters(base_lm, d_model, rank, act)
+        self.add_module(f"{name}_adapters", adapters)      # audio -> audio_adapters (legacy)
+        self._gates[name] = gate
+        self._handles.extend(handles)
+        return adapters, gate
+
+    def gate(self, name: str) -> AdapterGate:
+        return self._gates[name]
+
+    def scope(self, name: str):
+        """Open one pack's gate for a ``with`` block (spans fwd AND bwd — hold it
+        across the whole training step, per the gradient-checkpoint hazard)."""
+        return self._gates[name]
+
+    def names(self) -> list[str]:
+        return list(self._gates)
+
+    def parameters_of(self, name: str):
+        return getattr(self, f"{name}_adapters").parameters()
