@@ -2031,6 +2031,154 @@ def ingest_wavcaps_zip(source: str = "AudioSet_SL", frame_shard: str = "",
     return result
 
 
+_AC_CSV = "https://raw.githubusercontent.com/cdjkim/audiocaps/master/{d}/{s}.csv"
+
+
+@app.function(gpu="L4", volumes={VOL: volume}, secrets=[hf_secret], timeout=12 * 3600,
+              memory=32768, cpu=8.0, env=HF_ENV)
+def ingest_ac2_zip(frame_shard: str = "ac2_new", zip_path: str = "/vol/ac2/audiocaps_raw_audio.zip",
+                   audio_feature_layer: str = "post_proj", shard_size: int = 512,
+                   limit: int = 0, batch: int = 16) -> dict:
+    """AudioCaps 2.0 NEW-clip pool (user's form-gated audio zip) -> fused frames.
+
+    Ingests ONLY the AC2-train clips that are not in AC1 train (the existing
+    ``audiocaps_train_full`` shard already covers those with their AC1 captions;
+    the v0.4 lesson says do not replace captions that already work). Captions come
+    from the public AC2.0 CSVs in the cdjkim/audiocaps repo; the eval blacklist is
+    AC1/AC2 val+test (identical splits, verified). Reads wavs straight out of the
+    Volume-resident zip (no 56GB extraction); decode -> Whisper mel -> frozen tower
+    -> sharded frames, per-shard Volume commits, heartbeats (P0b OOM lessons).
+    """
+    import csv
+    import io as _io
+    import json
+    import urllib.request
+    import zipfile
+
+    import librosa
+    import soundfile as sf
+    import torch
+    from transformers import AutoFeatureExtractor
+
+    from fusion_embedding.data import write_frame_shard
+    from fusion_embedding.hf_components import load_audio_tower
+    from fusion_embedding.paths import frames_dir
+    import os
+
+    def _csv_keys(dataset_dir: str, split: str):
+        url = _AC_CSV.format(d=dataset_dir, s=split)
+        with urllib.request.urlopen(url, timeout=120) as r:
+            rows = list(csv.DictReader(_io.TextIOWrapper(r, encoding="utf-8",
+                                                         errors="replace")))
+        out = {}
+        for row in rows:
+            yt, st = row.get("youtube_id"), row.get("start_time")
+            if not yt or st is None or str(st).strip() == "":
+                continue
+            try:
+                k = f"{yt}_{int(float(st))}"
+            except ValueError:
+                continue
+            out.setdefault(k, str(row.get("caption", "")).strip())
+        return out
+
+    ac1_train = _csv_keys("dataset", "train")
+    bl = set()
+    for dd, ss in (("dataset", "val"), ("dataset", "test"),
+                   ("dataset2.0", "val"), ("dataset2.0", "test")):
+        bl |= set(_csv_keys(dd, ss))
+    ac2_train = _csv_keys("dataset2.0", "train")
+    new_pool = {k: v for k, v in ac2_train.items()
+                if k not in ac1_train and k not in bl and v}
+    n_bl_hits = sum(1 for k in ac2_train if k in bl)
+    assert n_bl_hits == 0, f"AC2 train hits eval blacklist: {n_bl_hits}"
+    print(f"AC2: train {len(ac2_train)} | AC1 train {len(ac1_train)} | "
+          f"new pool {len(new_pool)} | blacklist ids {len(bl)}", flush=True)
+
+    dev = "cuda"
+    token = os.environ.get("HF_TOKEN") or None
+    fe = AutoFeatureExtractor.from_pretrained(AUDIO_MODEL, trust_remote_code=True, token=token)
+    sr = fe.sampling_rate
+    enc, _fe, d_audio = load_audio_tower(device=dev, dtype=torch.bfloat16,
+                                         audio_feature_layer=audio_feature_layer)
+
+    zf = zipfile.ZipFile(zip_path)
+    members = {n.rsplit("/", 1)[-1][:-4]: n for n in zf.namelist()
+               if n.lower().endswith(".wav")}
+    todo = sorted(k for k in new_pool if k in members)
+    print(f"zip wavs {len(members)} | ingest list {len(todo)}", flush=True)
+
+    out_dir = frames_dir(frame_shard)
+    os.makedirs(str(out_dir), exist_ok=True)
+    mel_buf: list = []; cap_buf: list = []
+    shard_recs: list = []; captions: list = []; tasks: list = []; shard_files: list = []
+    kept = n_bad = 0
+
+    def _run_tower():
+        if not mel_buf:
+            return
+        n_mels = mel_buf[0].shape[0]; fmax = max(m.shape[1] for m in mel_buf)
+        mb = torch.zeros(len(mel_buf), n_mels, fmax, device=dev)
+        mm = torch.zeros(len(mel_buf), fmax, dtype=torch.bool, device=dev)
+        for i, m in enumerate(mel_buf):
+            mb[i, :, : m.shape[1]] = m.to(dev); mm[i, : m.shape[1]] = True
+        with torch.no_grad():
+            frames, fmask = enc(mb, mm)
+        for i, cap in enumerate(cap_buf):
+            t = int(fmask[i].sum().item())
+            shard_recs.append({"frames": frames[i, :t].cpu().contiguous(),
+                               "text": cap, "task": "sound"})
+            captions.append(cap); tasks.append("sound")
+        mel_buf.clear(); cap_buf.clear()
+
+    def _write_shard():
+        if not shard_recs:
+            return
+        name = f"shard-{len(shard_files):04d}.pt"
+        write_frame_shard(out_dir / name, shard_recs, half=True)
+        shard_files.append(name); shard_recs.clear(); volume.commit()
+
+    for k in todo:
+        try:
+            with zf.open(members[k]) as fh:
+                wav, sr0 = sf.read(_io.BytesIO(fh.read()), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sr0 != sr:
+                wav = librosa.resample(wav, orig_sr=sr0, target_sr=sr)
+        except Exception:                                        # noqa: BLE001
+            n_bad += 1
+            continue
+        feats = fe(wav, sampling_rate=sr, return_tensors="pt", return_attention_mask=True,
+                   padding="max_length", truncation=True)
+        mel = feats["input_features"][0]
+        am = feats.get("attention_mask")
+        if am is not None:
+            mel = mel[:, : int(am[0].sum().item())]
+        mel_buf.append(mel); cap_buf.append(new_pool[k]); kept += 1
+        if len(mel_buf) >= batch:
+            _run_tower()
+        if len(shard_recs) >= shard_size:
+            _write_shard()
+        if kept % 1000 == 0:
+            print(f"AC2_INGEST: kept={kept}/{len(todo)} bad={n_bad} "
+                  f"shards={len(shard_files)}", flush=True)
+        if limit and kept >= limit:
+            break
+    _run_tower(); _write_shard()
+
+    with open(str(out_dir / "index.json"), "w") as fh:
+        json.dump({"d_audio": d_audio, "shard_size": shard_size, "n_total": kept,
+                   "captions": captions, "tasks": tasks, "shards": shard_files}, fh)
+    volume.commit()
+    result = {"frame_shard": frame_shard, "kept": kept, "decode_fail": n_bad,
+              "new_pool": len(new_pool), "ingest_list": len(todo),
+              "shards": len(shard_files), "d_audio": d_audio,
+              "eval_blacklist_ids": len(bl), "ac2_train_bl_hits": 0}
+    print(f"INGEST_AC2_ZIP: {json.dumps(result)}", flush=True)
+    return result
+
+
 @app.function(volumes={VOL: volume}, secrets=[hf_secret], timeout=12 * 3600,
               memory=32768, env=HF_ENV)
 def preprocess_wavcaps(source: str = "SoundBible", shard: str = "", limit: int = 0,
