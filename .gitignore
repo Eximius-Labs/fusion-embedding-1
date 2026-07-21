@@ -23,3 +23,6 @@ release/out/
 release/UPLOAD.md
 fe2_release/out/
 submission/
+data/
+_staging_space/
+thermal_pack_release/
