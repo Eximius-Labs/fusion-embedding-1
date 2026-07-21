@@ -211,6 +211,10 @@ def run(arm: str = "full", smoke: bool = False, seed: int = 1) -> dict:
     for p in base.parameters():
         p.requires_grad_(False)
     proc = AutoProcessor.from_pretrained(BASE_MODEL, trust_remote_code=True)
+    ip = getattr(proc, "image_processor", None)
+    if ip is not None and hasattr(ip, "max_pixels"):
+        ip.max_pixels = 1310720          # cap vision tokens at LLVIP scale (1280x1024);
+        print(f"TP1_PROC max_pixels capped {ip.max_pixels}", flush=True)  # bounds memory
     lm = base.language_model if hasattr(base, "language_model") else base.model.language_model
     d_llm = lm.config.hidden_size if hasattr(lm, "config") else base.config.text_config.hidden_size
     for m in (lm, base):
@@ -263,8 +267,11 @@ def run(arm: str = "full", smoke: bool = False, seed: int = 1) -> dict:
     import contextlib
 
     def _proc_batch(pils, instruction):
+        # padding=True: IR-TD images VARY in size, so the processor expands a different
+        # number of image tokens per sample (LLVIP was uniform; this bit us at 82K scale).
         text = _chat(instruction, "<|vision_start|><|image_pad|><|vision_end|>")
-        return proc(text=[text] * len(pils), images=list(pils), return_tensors="pt").to(dev)
+        return proc(text=[text] * len(pils), images=list(pils), padding=True,
+                    return_tensors="pt").to(dev)
 
     def embed_images(paths, packs=None, gate="thermal", grad=False, chunk=None, hb=None):
         cz = chunk or len(paths)
