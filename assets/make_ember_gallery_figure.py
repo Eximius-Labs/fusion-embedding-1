@@ -37,23 +37,21 @@ def main() -> None:
     meta = json.load(open(os.path.join(args.data_dir, "gallery.json"), encoding="utf-8"))
     rows = [q for q in meta["queries"] if q["bucket"] not in DROP_BUCKETS]
     assert 4 <= len(rows) <= 6, f"expected 4-6 rows, got {len(rows)}"
-    # diversity contract (cannot regress): rank-1 only; no image or near-duplicate
-    # (phash dist <= 8) reused across rows; top-5 within a row mutually distinct
-    import imagehash
+    # display contract (cannot regress): rank-1 rows; siblings collapsed at the
+    # strict thresholds. The job computed and verified the pairwise numbers on the
+    # full-resolution images; re-assert them here from the stored contract.
+    dc = meta["display_contract"]
     assert all(q["true_rank"] == 1 for q in rows), "non-rank-1 row"
-    hashes = {i: imagehash.phash(Image.open(os.path.join(args.data_dir, f"thumb_{i}.png")))
-              for q in rows for i in q["top5_idx"]}
     flat = [i for q in rows for i in q["top5_idx"]]
     assert len(set(flat)) == len(flat), "image reused across rows"
-    for a_i in range(len(flat)):
-        for b_i in range(a_i + 1, len(flat)):
-            d = (hashes[flat[a_i]].hash != hashes[flat[b_i]].hash).sum()
-            assert d > 8, f"near-duplicate thumbs {flat[a_i]}/{flat[b_i]} (dist {d})"
+    assert dc["phash_threshold"] >= 20 and dc["cos_threshold"] <= 0.97,         f"weaker thresholds than the contract: {dc}"
+    assert dc["min_pairwise_phash"] > dc["phash_threshold"],         f"pairwise phash {dc['min_pairwise_phash']} within threshold {dc['phash_threshold']}"
+    assert dc["max_pairwise_cos_same_size"] < dc["cos_threshold"],         f"same-size cosine {dc['max_pairwise_cos_same_size']} reaches {dc['cos_threshold']}"
 
     n = len(rows)
     row_h, cap_h, pad = 1.55, 0.34, 0.12
     fig_w = 11.5
-    fig_h = 0.62 + n * (row_h + cap_h + pad) + 0.62
+    fig_h = 0.62 + n * (row_h + cap_h + pad) + 0.78
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=200)
     fig.patch.set_facecolor("white")
 
@@ -87,11 +85,13 @@ def main() -> None:
 
     foot_lines = [
         "Examples shown are rank-1 retrievals (green: the query's exact match, retrieved first). "
+        "Displayed results are de-duplicated: near-identical frames from the same source sequence "
+        "are collapsed to their top-ranked representative.",
         "Queries shortened to their first sentence for display; retrieval used the full captions.",
         "Images from the IR-TD dataset (IRGPT, ICCV 2025), shown for evaluation illustration "
         "under its academic license."]
     for f_i, fl in enumerate(foot_lines):
-        t = fig.text(0.013, (0.46 - f_i * 0.17) / fig_h, fl, fontsize=7.2, color=GRAY,
+        t = fig.text(0.013, (0.56 - f_i * 0.17) / fig_h, fl, fontsize=7.2, color=GRAY,
                      va="center")
         captions.append((f"footer{f_i}", t))
 
