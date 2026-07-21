@@ -110,6 +110,11 @@ def main() -> None:
                         "frozen_audio_tower": "Qwen/Qwen2.5-Omni-7B audio tower (not included)",
                         "format": "pt"})
     print(f"safetensors: {sum(v.numel() for v in flat.values())/1e6:.1f}M params exported")
+    # NOTE (v0.2 lesson): this config.json is the PACKAGER PAYLOAD only. The HF repo's
+    # live config.json also carries auto_map/architectures and the model-construction
+    # fields the trust_remote_code path requires — when pushing a weights update,
+    # MERGE this payload into the repo's existing config.json (see the v0.2 fixup
+    # 9451b840f0d1); replacing it wholesale breaks AutoModel loading.
     with open(os.path.join(OUT, "config.json"), "w", encoding="utf-8") as fh:
         json.dump({"model_type": "fusion-embedding-connector",
                    "adapter_rank": ck["config"].get("adapter_rank", 0),
