@@ -42,7 +42,7 @@ image = (
 )
 
 PACK_REPO = "EximiusLabs/fusion-embedding-2-ember"
-PACK_REV = "v0.1-preview"
+PACK_REV = "main"   # v0.1-preview snapshot keeps the pre-rename filename
 FE2_REPO = "EximiusLabs/fusion-embedding-2-2b-preview"
 FE2_REV = "v0.2-preview"
 IRTD_ROOT = "/vol/thermal/ir_td/Data4MLLM/IR-TD-version250724"
@@ -85,7 +85,7 @@ def smoke() -> dict:
         print(f"SMOKE {name}: {'PASS' if ok else 'FAIL'} {note}", flush=True)
 
     # ---- fresh pack download (no cache) ----
-    st_path = hf_hub_download(PACK_REPO, "thermal_adapters.safetensors",
+    st_path = hf_hub_download(PACK_REPO, "model.safetensors",
                               revision=PACK_REV, force_download=True)
     cfg_path = hf_hub_download(PACK_REPO, "config.json", revision=PACK_REV,
                                force_download=True)

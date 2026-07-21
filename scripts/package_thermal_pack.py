@@ -25,6 +25,7 @@ BASE = "Qwen/Qwen3-VL-Embedding-2B"
 
 CARD = """---
 license: cc-by-nc-4.0
+pipeline_tag: feature-extraction
 base_model: {fe2}
 tags:
 - embeddings
@@ -80,7 +81,7 @@ emb = FusionEmbedder.from_pretrained(
 packs = AdapterPacks()
 adapters, gate = packs.add_pack("thermal", emb.model.base_lm, 2048, rank=384)
 adapters.load_state_dict(load_file(hf_hub_download(
-    "{repo}", "thermal_adapters.safetensors")))
+    "{repo}", "model.safetensors")))
 packs.to("cuda")
 
 # thermal encode: thermal readout template, thermal scope open (the scope
@@ -186,7 +187,7 @@ def main() -> None:
                     weights_only=False)
     sd = ck["thermal_adapters"]
     assert len(sd) == 112 and ck["seed"] == 2 and ck["rank"] == 384
-    save_file(sd, os.path.join(OUT, "thermal_adapters.safetensors"),
+    save_file(sd, os.path.join(OUT, "model.safetensors"),
               metadata={"format": "pt", "pack": "thermal", "rank": "384",
                         "seed": str(ck["seed"]), "steps": str(ck["step"])})
 
