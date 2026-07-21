@@ -85,7 +85,13 @@ def _first_sentence(desc: str) -> str:
 
 @app.function(gpu="A100-80GB", image=image, secrets=[hf_secret],
               volumes={"/vol": volume}, timeout=10 * 3600, memory=32768)
-def run(arm: str = "full", smoke: bool = False, seed: int = 1) -> dict:
+def run(arm: str = "full", smoke: bool = False, seed: int = 1,
+        release: bool = False, mode: str = "train") -> dict:
+    """mode="train": one arm/seed end-to-end. mode="prep": build the shared release
+    caches (FLIR strip list, stripped text cache, holdout embeds + frozen baseline),
+    commit, then SPAWN the three release seed jobs and return their call IDs.
+    release=True: FLIR-stripped corpus (640x512 excluded), fresh holdout, 3900 steps
+    (~1 epoch over ~63K), ckpt thermal_release_seed<seed>.pt."""
     import gc
     import json
     import os
@@ -104,10 +110,15 @@ def run(arm: str = "full", smoke: bool = False, seed: int = 1) -> dict:
 
     t0 = time.time()
     dev = "cuda"
-    tag = f"{arm}{'_smoke' if smoke else ''}"
+    if mode == "prep":
+        release = True
+    smk = "_smoke" if smoke else ""
+    tag = f"{'release_' if release else ''}{arm}{smk}"
     os.makedirs(OUT_ROOT, exist_ok=True)
     os.makedirs(CKPT_DIR, exist_ok=True)
-    ckpt_path = os.path.join(CKPT_DIR, f"thermal_phase1_{arm}{'_smoke' if smoke else ''}.pt")
+    ckpt_path = os.path.join(
+        CKPT_DIR, f"thermal_release_seed{seed}{smk}.pt" if release
+        else f"thermal_phase1_{arm}{smk}.pt")
 
     # ---- PRE-FLIGHT: durable ckpt save + commit + readback BEFORE any spend ----
     torch.save({"preflight": torch.zeros(4)}, ckpt_path)
@@ -132,10 +143,49 @@ def run(arm: str = "full", smoke: bool = False, seed: int = 1) -> dict:
     n_missing = len(records) - len(kept)
     print(f"TP1_DATA missing image files dropped: {n_missing}", flush=True)
 
+    # ---- FLIR strip (release only): exclude every 640x512 image (both FLIR sources
+    # share that signature; census expects ~20,964 of 84,284). Strip list persisted
+    # to the Volume as release provenance. Applied BEFORE holdout selection so the
+    # fresh holdout is FLIR-free by construction. ----
+    strip_info = {}
+    if release:
+        if smoke:
+            kept = kept[:1500]                      # keep the smoke sweep cheap
+        strip_path = os.path.join(OUT_ROOT, f"release_strip_640x512{smk}.json")
+        if os.path.exists(strip_path):
+            stripped = set(json.load(open(strip_path, encoding="utf-8"))["excluded"])
+            print(f"TP1_STRIP cached list: {len(stripped)} excluded", flush=True)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _size(r):
+                try:
+                    with Image.open(img_abspath(r["image_path"])) as im:
+                        return r["image_path"], im.size
+                except Exception:
+                    return r["image_path"], None
+            t_sz = time.time()
+            with ThreadPoolExecutor(16) as ex:
+                sizes = list(ex.map(_size, kept))
+            stripped = {p for p, s in sizes if s == (640, 512)}
+            json.dump({"rule": "image size == 640x512 (FLIR signature)",
+                       "census_expected": 20964, "excluded_n": len(stripped),
+                       "excluded": sorted(stripped)},
+                      open(strip_path, "w", encoding="utf-8"))
+            volume.commit()
+            print(f"TP1_STRIP size sweep {len(kept)} imgs in {time.time() - t_sz:.0f}s",
+                  flush=True)
+        n_before = len(kept)
+        kept = [r for r in kept if r["image_path"] not in stripped]
+        strip_info = {"strip_rule": "640x512 (FLIR)", "excluded": n_before - len(kept),
+                      "kept_after_strip": len(kept), "strip_list": strip_path}
+        print(f"TP1_STRIP {json.dumps(strip_info)}", flush=True)
+
     # deterministic holdout (disjoint by image)
     rng = np.random.RandomState(0)
     order = rng.permutation(len(kept))
-    holdout_idx = set(order[:HOLDOUT_N].tolist())
+    ho_n = 200 if smoke else HOLDOUT_N
+    holdout_idx = set(order[:ho_n].tolist())
     holdout = [kept[i] for i in sorted(holdout_idx)]
     train = [kept[i] for i in range(len(kept)) if i not in holdout_idx]
     if smoke:
@@ -305,19 +355,49 @@ def run(arm: str = "full", smoke: bool = False, seed: int = 1) -> dict:
                                      [:, None]).expand_as(sims)).sum(1)
         return {f"R@{k}": round((ranks <= k).float().mean().item(), 4) for k in (1, 5, 10)}
 
-    # ---- frozen holdout baseline (gate 1 reference) ----
+    # ---- frozen holdout baseline (gate 1 reference; tag-keyed cache shared by seeds) ----
     ho_paths = [img_abspath(r["image_path"]) for r in holdout]
-    ho_text = embed_texts([r["description"] for r in holdout]).to(dev)       # eval on FULL
-    ho_text_short = embed_texts([_first_sentence(r["description"]) for r in holdout]).to(dev)
-    print("TP1: frozen holdout baseline ...", flush=True)
-    ho_frozen = embed_images(ho_paths, chunk=8, hb="ho_frozen")
+    ho_cache = os.path.join(OUT_ROOT, f"ho_{tag}.pt")
+    if os.path.exists(ho_cache):
+        blob = torch.load(ho_cache, map_location="cpu")
+        assert blob["n"] == len(holdout), "holdout cache size mismatch"
+        ho_text, ho_text_short, ho_frozen = (blob["text"].to(dev),
+                                             blob["text_short"].to(dev),
+                                             blob["frozen"].to(dev))
+        print(f"TP1_BASELINE cached holdout embeds {tuple(ho_frozen.shape)}", flush=True)
+    else:
+        ho_text = embed_texts([r["description"] for r in holdout]).to(dev)   # eval on FULL
+        ho_text_short = embed_texts([_first_sentence(r["description"]) for r in holdout]).to(dev)
+        print("TP1: frozen holdout baseline ...", flush=True)
+        ho_frozen = embed_images(ho_paths, chunk=8, hb="ho_frozen")
+        torch.save({"n": len(holdout), "text": ho_text.cpu(),
+                    "text_short": ho_text_short.cpu(), "frozen": ho_frozen.cpu()},
+                   ho_cache)
+        volume.commit()
     base_full = retrieval_r(ho_frozen, ho_text)
     base_short = retrieval_r(ho_frozen, ho_text_short)
     print(f"TP1_BASELINE frozen holdout t2t: full {json.dumps(base_full)} "
           f"short {json.dumps(base_short)}", flush=True)
 
+    # ---- prep mode: shared caches are built + committed; spawn the three seeds ----
+    if mode == "prep":
+        f_run = modal.Function.from_name("fusion-thermal-phase1", "run")
+        spawned = [f_run.spawn(arm=arm, smoke=smoke, seed=s, release=True).object_id
+                   for s in (1, 2, 3)]
+        prep_out = {"mode": "prep", "arm": arm, "smoke": smoke,
+                    "spawned_seeds": spawned, **strip_info,
+                    "train_n": len(train), "holdout_n": len(holdout),
+                    "dedup_hits": len(dedup_hits),
+                    "baseline_frozen_holdout": {"full": base_full, "short": base_short},
+                    "runtime_s": round(time.time() - t0, 1)}
+        json.dump(prep_out, open(os.path.join(OUT_ROOT, f"prep_{tag}.json"), "w",
+                                 encoding="utf-8"), indent=2)
+        volume.commit()
+        print("TP1_PREP_RESULT:", json.dumps(prep_out), flush=True)
+        return prep_out
+
     # ---- train the thermal pack ----
-    steps = 25 if smoke else 5000
+    steps = 25 if smoke else (3900 if release else 5000)   # ~1 epoch over ~63K stripped
     bs = 8 if smoke else 16
     bank_k = 128 if smoke else 1024
     torch.manual_seed(seed)
@@ -502,7 +582,8 @@ def run(arm: str = "full", smoke: bool = False, seed: int = 1) -> dict:
     gate2 = zs_pack >= 87.0
     gate3 = iso_rgb and iso_text
     result = {
-        "phase": "thermal_phase1", "arm": arm, "smoke": smoke, "seed": seed,
+        "phase": "thermal_release" if release else "thermal_phase1",
+        "arm": arm, "smoke": smoke, "seed": seed, **strip_info,
         "base": BASE_MODEL, "rank": RANK, "steps": steps, "batch": bs, "bank": bank_k,
         "data": {"irtd_records": len(records), "missing_files": n_missing,
                  "train_after_dedup": len(train), "holdout": len(holdout),
@@ -524,7 +605,9 @@ def run(arm: str = "full", smoke: bool = False, seed: int = 1) -> dict:
                        "llvip_use": "eval only (ZS gate + twin generalization)"},
         "runtime_s": round(time.time() - t0, 1),
     }
-    out_json = os.path.join(OUT_ROOT, f"result_{tag}.json")
+    out_json = os.path.join(OUT_ROOT,
+                            f"result_{tag}_seed{seed}.json" if release
+                            else f"result_{tag}.json")
     json.dump(result, open(out_json, "w", encoding="utf-8"), indent=2)
     volume.commit()
     print("TP1_RESULT:", json.dumps(result), flush=True)
