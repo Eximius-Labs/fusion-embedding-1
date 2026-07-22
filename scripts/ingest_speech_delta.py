@@ -280,7 +280,13 @@ def ingest_msw(target: int = 150_000, per_word_cap: int = 30, limit: int = 0,
                 if not m.name.endswith((".wav", ".opus")):
                     continue
                 seen += 1
-                word = os.path.basename(os.path.dirname(m.name)).strip()
+                # MSW tars are FLAT files named "<word>_common_voice_en_<id>.wav"
+                # (the word is a filename PREFIX, not a directory). The old code
+                # read os.path.dirname -> "" -> every clip silently skipped, so the
+                # shard came out empty. Split on the CV delimiter.
+                stem = os.path.splitext(os.path.basename(m.name))[0]
+                word = (stem.split("_common_voice_en_")[0]
+                        if "_common_voice_en_" in stem else "").strip()
                 if not word:
                     continue
                 if per_word[word] >= per_word_cap:
@@ -301,6 +307,65 @@ def ingest_msw(target: int = 150_000, per_word_cap: int = 30, limit: int = 0,
               "decode_fail": bad, "distinct_words": len(per_word), **stats}
     print("INGEST_MSW:", json.dumps(result), flush=True)
     return result
+
+
+@app.function(image=image, secrets=[hf_secret], volumes={VOL: volume},
+              cpu=4.0, memory=16384, timeout=1800, env=HF_ENV)
+def peek_msw() -> dict:
+    """Diagnostic: open the first MSW train tar, tally member extensions, and try
+    to decode the first few audio members with NO exception swallowing — to see
+    the real reason ingest_msw persisted zero frames."""
+    import collections
+    import io
+    import os
+    import tarfile
+
+    import soundfile as sf
+    from huggingface_hub import HfApi, hf_hub_download
+
+    api = HfApi()
+    tars = sorted(
+        (f for f in api.list_repo_files("MLCommons/ml_spoken_words",
+                                        repo_type="dataset")
+         if f.startswith("data/wav/en/train/audio/") and f.endswith(".tar.gz")),
+        key=lambda p: int(p.rsplit("/", 1)[-1].split(".")[0]))
+    out = {"n_tars": len(tars), "first_tar": tars[0] if tars else None}
+    local = hf_hub_download("MLCommons/ml_spoken_words", tars[0], repo_type="dataset")
+    exts = collections.Counter()
+    names = []
+    decoded = []
+    with tarfile.open(local, "r:gz") as tar:
+        members = [m for m in tar if m.isfile()]
+        for m in members[:2000]:
+            exts[os.path.splitext(m.name)[1]] += 1
+            if len(names) < 6:
+                names.append(m.name)
+        out["ext_counts"] = dict(exts)
+        out["member_names_sample"] = names
+        # decode attempts (raise on failure so we see the true error)
+        audio = [m for m in members if m.name.endswith((".wav", ".opus", ".mp3"))]
+        out["n_audio_members"] = len(audio)
+        for m in audio[:4]:
+            raw = tar.extractfile(m).read()
+            try:
+                wav, sr0 = sf.read(io.BytesIO(raw), dtype="float32")
+                decoded.append({"name": m.name, "sr": int(sr0),
+                                "shape": list(wav.shape), "dur_s": round(len(wav) / sr0, 3),
+                                "via": "soundfile"})
+            except Exception as e:                       # noqa: BLE001
+                try:
+                    import librosa
+                    wav, sr0 = librosa.load(io.BytesIO(raw), sr=None, mono=True)
+                    decoded.append({"name": m.name, "sr": int(sr0),
+                                    "dur_s": round(len(wav) / sr0, 3),
+                                    "via": "librosa", "sf_error": f"{type(e).__name__}: {str(e)[:80]}"})
+                except Exception as e2:                  # noqa: BLE001
+                    decoded.append({"name": m.name, "FAILED": f"{type(e2).__name__}: {str(e2)[:100]}"})
+    os.remove(local)
+    out["decoded"] = decoded
+    import json
+    print("PEEK_MSW:", json.dumps(out)[:2000], flush=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -680,10 +745,28 @@ def run_all(msw: int = 150_000, libri: int = 150_000, jamendo: int = 13_000,
     from fusion_embedding.paths import frames_dir
 
     def done(shard: str, tgt: int) -> int:
-        ip = frames_dir(shard) / "index.json"
+        """A shard counts as finalized ONLY if its index reports n_total > 0 AND the
+        shard-*.pt files actually exist and match ceil(n_total/shard_size). An empty
+        or partial index (the MSW-empty-stub bug) must NEVER be treated as done."""
+        import math
+        fd = frames_dir(shard)
+        ip = fd / "index.json"
         if not ip.exists():
             return 0
-        return int(json.load(open(str(ip), encoding="utf-8")).get("n_total", 0))
+        ix = json.load(open(str(ip), encoding="utf-8"))
+        n = int(ix.get("n_total", 0))
+        if n <= 0:
+            return 0
+        ss = int(ix.get("shard_size", 512))
+        listed = ix.get("shards", [])
+        expected = math.ceil(n / ss)
+        present = sum(1 for s in listed if (fd / s).exists())
+        if len(listed) != expected or present != expected:
+            print(f"  AUDIT {shard}: n_total={n} but shards listed={len(listed)} "
+                  f"present={present} expected={expected} -> NOT done, will re-ingest",
+                  flush=True)
+            return 0
+        return n
 
     results: dict = {}
     volume.reload()
@@ -728,6 +811,51 @@ def run_all(msw: int = 150_000, libri: int = 150_000, jamendo: int = 13_000,
     results["manifest"] = write_manifest.remote(shards=shards)
     print("RUN_ALL_DONE:", json.dumps(results, default=str)[:2500], flush=True)
     return results
+
+
+# ---------------------------------------------------------------------------
+# strict per-shard audit — HARD gate before compose/train
+# ---------------------------------------------------------------------------
+@app.function(image=image, secrets=[hf_secret], volumes={VOL: volume},
+              cpu=2.0, memory=8192, timeout=1800, env=HF_ENV)
+def audit_shards(shards: str = "msw_train,librispeech_train,fma_train,cv_train",
+                 require_all: bool = True) -> dict:
+    """For every shard: assert index.n_total > 0 AND the shard-*.pt files exist and
+    match ceil(n_total/shard_size). Returns a table; if require_all, RAISES on any
+    failure so a broken corpus can never reach training (the MSW-empty-stub bug)."""
+    import json
+    import math
+    import os
+
+    from fusion_embedding.paths import frames_dir
+
+    volume.reload()
+    table = {}
+    failures = []
+    for s in [x.strip() for x in shards.split(",") if x.strip()]:
+        fd = frames_dir(s)
+        ip = fd / "index.json"
+        if not ip.exists():
+            table[s] = {"status": "MISSING_INDEX"}
+            failures.append(s)
+            continue
+        ix = json.load(open(str(ip), encoding="utf-8"))
+        n = int(ix.get("n_total", 0))
+        ss = int(ix.get("shard_size", 512))
+        listed = ix.get("shards", [])
+        expected = math.ceil(n / ss) if n > 0 else 0
+        present = sum(1 for sh in listed if os.path.exists(str(fd / sh)))
+        ok = n > 0 and len(listed) == expected and present == expected
+        table[s] = {"n_total": n, "shards_listed": len(listed),
+                    "shards_present": present, "expected": expected,
+                    "text_cache": bool(ix.get("text_cache", False)),
+                    "status": "OK" if ok else "FAIL"}
+        if not ok:
+            failures.append(s)
+    print("AUDIT_SHARDS:", json.dumps(table, indent=1), flush=True)
+    if require_all and failures:
+        raise AssertionError(f"shard audit FAILED for {failures} — do not compose/train")
+    return {"table": table, "failures": failures}
 
 
 # ---------------------------------------------------------------------------
