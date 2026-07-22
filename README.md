@@ -11,6 +11,7 @@ vision-language embedding base with audio — without modifying a single base we
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-research%20preview-orange.svg)](#roadmap)
+[![Paper](https://img.shields.io/badge/paper-arXiv%3A2607.18666-b31b1b.svg)](https://arxiv.org/abs/2607.18666)
 
 </div>
 
@@ -469,20 +470,14 @@ Matryoshka Representation Learning, and the audio-caption data ecosystem
 
 ## Citation
 
-```bibtex
-@software{fusion_embedding_2026,
-  title  = {Fusion Embedding 1: A Unified Embedding Space for Text,
-            Image, Video, and Audio},
-  author = {Tonmoy, Abdul Basit},
-  year   = {2026},
-  url    = {https://github.com/Eximius-Labs/fusion-embedding}
-}
+The Fusion Embedding family is described in our arXiv report
+(https://arxiv.org/abs/2607.18666):
 
-@software{fusion_embedding_2_2026,
-  title  = {Fusion Embedding 2: A Unified Embedding Space for Text,
-            Image, Video, and Audio with Modality-Gated Deep Adapters},
-  author = {Tonmoy, Abdul Basit},
-  year   = {2026},
-  url    = {https://github.com/Eximius-Labs/fusion-embedding}
+```bibtex
+@article{tonmoy2026fusion,
+  title   = {Fusion Embedding: A Unified Embedding Space for Text, Image, Video, and Audio},
+  author  = {Tonmoy, Abdul Basit and Hoque, Kazi Fardinul and Arham, Md. Shahrier Islam and Luthra, Arman},
+  journal = {arXiv preprint arXiv:2607.18666},
+  year    = {2026}
 }
 ```
