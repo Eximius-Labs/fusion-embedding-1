@@ -565,6 +565,98 @@ def ingest_jamendo(target: int = 40_000, limit: int = 0,
 
 
 # ---------------------------------------------------------------------------
+# Common Voice 26 (en): accent + speaker balanced validated clips, CC0
+# ---------------------------------------------------------------------------
+@app.function(gpu="L4", image=image, secrets=[hf_secret], volumes={VOL: volume},
+              cpu=8.0, memory=32768, timeout=20 * 3600, env=HF_ENV)
+def ingest_cv26(target: int = 70_000, per_speaker_cap: int = 12,
+                unlabeled_accent_frac: float = 0.40, limit: int = 0,
+                frame_shard: str = "cv_train") -> dict:
+    """Sample validated English CV26 clips from the on-volume 94GB tar.gz, balanced
+    by accent and capped per speaker (client_id) so no voice dominates. gzip is
+    non-seekable, so we stream once and decide on the fly, stopping at target.
+
+    mp3 members are read FULLY into io.BytesIO before decode (the same non-seekable
+    stream fix as LibriSpeech flac). Transcript-as-caption. CC0; no re-hosting of
+    audio (we ship trained weights + frame tensors, not the clips)."""
+    import collections
+    import io as _io
+    import json
+    import os
+    import tarfile
+
+    import pandas as pd
+    import soundfile as sf
+
+    from fusion_embedding.speech_captions import caption_for_transcript
+
+    tgt = limit or target
+    tar_path = f"{VOL}/cv26/cv-corpus-26.0-en.tar.gz"
+    tsv = f"{VOL}/cv26/extracted/validated.tsv"
+
+    # basename -> (sentence, client_id, accent). Only the columns we need.
+    df = pd.read_csv(tsv, sep="\t", low_memory=False,
+                     usecols=["path", "sentence", "client_id", "accents"],
+                     encoding="utf-8")
+    df = df.dropna(subset=["path", "sentence"])
+    meta = {os.path.basename(str(p)): (str(s), str(c), str(a) if isinstance(a, str) else "")
+            for p, s, c, a in zip(df["path"], df["sentence"],
+                                  df["client_id"], df["accents"])}
+    print(f"CV26: {len(meta)} validated clips in metadata", flush=True)
+    del df
+
+    sink = _FrameSink(frame_shard, domain="speech_sentence")
+    spk = collections.Counter()
+    acc = collections.Counter()
+    unlabeled_cap = int(tgt * unlabeled_accent_frac)
+    seen = matched = bad = capped = 0
+    with tarfile.open(tar_path, "r:gz") as tar:
+        for m in tar:
+            if sink.kept >= tgt:
+                break
+            if not m.name.endswith(".mp3"):
+                continue
+            seen += 1
+            if seen % 500 == 0:
+                print(f"  cv26: seen={seen} matched={matched} kept={sink.kept} "
+                      f"capped={capped} bad={bad} accents={len(acc)}", flush=True)
+            info = meta.get(os.path.basename(m.name))
+            if info is None:
+                continue                                 # not validated
+            sentence, client_id, accent = info
+            matched += 1
+            if spk[client_id] >= per_speaker_cap:
+                capped += 1
+                continue
+            bucket = accent or "_unlabeled"
+            if bucket == "_unlabeled" and acc[bucket] >= unlabeled_cap:
+                capped += 1
+                continue
+            try:
+                raw = tar.extractfile(m).read()
+                wav, sr0 = sf.read(_io.BytesIO(raw), dtype="float32")
+            except Exception:                            # noqa: BLE001
+                try:
+                    import librosa
+                    wav, sr0 = librosa.load(_io.BytesIO(raw), sr=None, mono=True)
+                except Exception:                        # noqa: BLE001
+                    bad += 1
+                    continue
+            spk[client_id] += 1
+            acc[bucket] += 1
+            sink.add(wav, sr0, caption_for_transcript(sentence, sink.kept))
+    stats = sink.finalize()
+    result = {"frame_shard": frame_shard, "source": "CommonVoice-26.0:en (validated)",
+              "license": "CC0 (no audio re-host; frame tensors + weights only)",
+              "seen": seen, "matched_validated": matched, "speaker_capped": capped,
+              "decode_fail": bad, "distinct_speakers": len(spk),
+              "distinct_accents": len(acc),
+              "top_accents": dict(acc.most_common(10)), **stats}
+    print("INGEST_CV26:", json.dumps(result), flush=True)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # self-contained orchestrator: frames (per source) -> text cache -> manifest
 # ---------------------------------------------------------------------------
 @app.function(image=image, secrets=[hf_secret], volumes={VOL: volume},
