@@ -553,6 +553,80 @@ def ingest_jamendo(target: int = 40_000, limit: int = 0,
 
 
 # ---------------------------------------------------------------------------
+# self-contained orchestrator: frames (per source) -> text cache -> manifest
+# ---------------------------------------------------------------------------
+@app.function(image=image, secrets=[hf_secret], volumes={VOL: volume},
+              cpu=2.0, memory=8192, timeout=24 * 3600, env=HF_ENV)
+def run_all(msw: int = 150_000, libri: int = 150_000, jamendo: int = 13_000,
+            fma: int = 20_000, skip_cv: bool = True, native_template: bool = True,
+            cache_tag: str = "_native") -> dict:
+    """One driver container. Each phase is a blocking .remote() (its own right-sized
+    container) so there is no external monitor to drop between phases; resumable via
+    per-source completion checks, so a re-spawn continues where it stopped.
+
+    Common Voice is skipped (Mozilla Data Collective now account-gates it); the
+    LibriSpeech quota is raised across three subsets to backfill the sentence tier,
+    per the directive. Jamendo is capped at the ~13K commercial-OK (CC-BY / CC-BY-SA)
+    tracks that exist in MTG's audio_licenses.txt after the license-filter fix.
+    """
+    import json
+
+    import modal
+
+    from fusion_embedding.paths import frames_dir
+
+    def done(shard: str, tgt: int) -> int:
+        ip = frames_dir(shard) / "index.json"
+        if not ip.exists():
+            return 0
+        return int(json.load(open(str(ip), encoding="utf-8")).get("n_total", 0))
+
+    results: dict = {}
+    volume.reload()
+
+    n = done("msw_train", msw)
+    results["msw"] = {"skipped_done": n} if n >= 0.95 * msw else \
+        ingest_msw.remote(target=msw)
+    n = done("librispeech_train", libri)
+    results["librispeech"] = {"skipped_done": n} if n >= 0.95 * libri else \
+        ingest_librispeech.remote(
+            target=libri, subsets="train-clean-100,train-clean-360,train-other-500")
+    if jamendo > 0:
+        n = done("jamendo_train", jamendo)
+        results["jamendo"] = {"skipped_done": n} if n >= 0.90 * jamendo else \
+            ingest_jamendo.remote(target=jamendo)
+    else:
+        results["jamendo"] = {"deferred": "license filter fixed; mirror audio-member "
+                              "format (webdataset 'audio' field) needs confirmation "
+                              "before enabling — music backfilled by FMA this run"}
+    n = done("fma_train", fma)
+    results["fma"] = {"skipped_done": n} if n >= 0.95 * fma else \
+        ingest_fma.remote(target=fma)
+    if not skip_cv:
+        results["common_voice"] = "requested but not implemented (MDC-gated)"
+
+    # Compose the text-cache / manifest shard list from sources that ACTUALLY
+    # produced non-empty shards, so a deferred or empty source can't break the
+    # downstream assertions.
+    volume.reload()
+    candidate = ["msw_train", "librispeech_train", "jamendo_train", "fma_train"]
+    present = [s for s in candidate if done(s, 1) > 0]
+    shards = ",".join(present)
+    results["ingested_shards"] = {s: done(s, 1) for s in present}
+    # text cache (RAW pooled frozen-base text embeddings) via the deployed trainer app;
+    # load_in_4bit=False = bf16, the FE2 training lineage precision. This MUST match the
+    # precision of the sound-core `_native` cache the pretrain composes with — the
+    # pretrain launch should verify and rebuild (cheap: text-only) if the core differs.
+    volume.reload()
+    tc = modal.Function.from_name("fusion-embedding", "precompute_text_cache")
+    results["text_cache"] = tc.remote(frame_shard=shards, native_template=native_template,
+                                      cache_tag=cache_tag, load_in_4bit=False)
+    results["manifest"] = write_manifest.remote(shards=shards)
+    print("RUN_ALL_DONE:", json.dumps(results, default=str)[:2500], flush=True)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # manifest over whatever delta shards exist
 # ---------------------------------------------------------------------------
 @app.function(image=image, secrets=[hf_secret], volumes={VOL: volume},
