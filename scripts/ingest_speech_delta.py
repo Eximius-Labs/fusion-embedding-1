@@ -339,6 +339,9 @@ def ingest_librispeech(target: int = 100_000, limit: int = 0, max_dur_s: float =
                        timeout=4 * 3600)
         print(f"  {name}: {os.path.getsize(tar_path) / 1e9:.1f} GB", flush=True)
         # extract sequentially (tar is seek-hostile); transcripts arrive near their flacs
+        import gc
+        import io as _io
+        seen = 0
         with tarfile.open(tar_path, "r:gz") as tar:
             trans: dict = {}
             for m in tar:
@@ -346,17 +349,26 @@ def ingest_librispeech(target: int = 100_000, limit: int = 0, max_dur_s: float =
                     break
                 if m.name.endswith(".trans.txt"):
                     fh = tar.extractfile(m)
-                    for line in fh.read().decode("utf-8").splitlines():
+                    for line in fh.read().decode("utf-8", "replace").splitlines():
                         uid, _, txt = line.partition(" ")
                         trans[uid] = txt
                 elif m.name.endswith(".flac"):
+                    seen += 1
+                    if seen % 500 == 0:                # heartbeat: extraction+decode alive
+                        print(f"  {name}: seen={seen} kept={sink.kept} "
+                              f"too_long={too_long} bad={bad}", flush=True)
+                        gc.collect()
                     uid = os.path.basename(m.name)[:-5]
                     txt = trans.get(uid)
                     if txt is None:
                         continue                       # transcript block not seen yet
-                    fh = tar.extractfile(m)
+                    # Read the member fully into memory FIRST, then decode from a
+                    # seekable BytesIO. flac decoding needs seeks; libsndfile
+                    # deadlocks/hangs on the raw non-seekable gzip-tar stream (the
+                    # 2.5h silent hang). MSW uses this same wrap and never stalled.
                     try:
-                        wav, sr0 = sf.read(fh, dtype="float32")
+                        raw = tar.extractfile(m).read()
+                        wav, sr0 = sf.read(_io.BytesIO(raw), dtype="float32")
                     except Exception:                            # noqa: BLE001
                         bad += 1
                         continue
