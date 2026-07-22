@@ -470,8 +470,18 @@ Matryoshka Representation Learning, and the audio-caption data ecosystem
 
 ## Citation
 
-The Fusion Embedding family is described in our arXiv report
-(https://arxiv.org/abs/2607.18666):
+To cite the models (weights and recipe):
+
+```bibtex
+@software{fusion_embedding_2026,
+  title  = {Fusion Embedding},
+  author = {Tonmoy, Abdul Basit},
+  year   = {2026},
+  url    = {https://github.com/Eximius-Labs/fusion-embedding}
+}
+```
+
+To cite the paper:
 
 ```bibtex
 @article{tonmoy2026fusion,
